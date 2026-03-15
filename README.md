@@ -6,7 +6,7 @@ A personal analytics dashboard for [Trackman](https://www.trackman.com/) golf da
 
 ## Features
 
-- **Sync your data** — logs into `portal.trackmangolf.com` via Playwright, intercepts the GraphQL session list, and pulls full shot-by-shot data from the Trackman report API
+- **Sync your data** — logs into `portal.trackmangolf.com` with your own credentials and pulls your shot history into a local database
 - **Shot Quality Score (SQS)** — proprietary 0–100 scoring system benchmarked against PGA Tour averages for carry distance and accuracy, not your personal averages
 - **Trends page** — metrics over time, shot quality distribution per session, avg SQS trend by club
 - **Session detail** — per-session shot log with manual exclusion, scatter plot explorer, session averages
@@ -148,3 +148,9 @@ Opens at [http://localhost:8501](http://localhost:8501).
 ## Privacy
 
 All data is stored locally on your machine. Nothing is sent to any external server beyond the Trackman API calls needed to fetch your own data.
+
+---
+
+## Disclaimer
+
+This is an independent personal project and is not affiliated with, endorsed by, or associated with Trackman A/S in any way. Trackman is a registered trademark of Trackman A/S. This tool accesses only your own data using your own credentials and is intended strictly for personal use.
