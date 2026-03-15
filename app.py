@@ -38,7 +38,8 @@ METRIC_LABELS = {
 }
 
 KEY_METRICS = ["ball_speed", "club_speed", "smash_factor", "carry", "total",
-               "launch_angle", "total_spin", "attack_angle", "club_path", "face_angle"]
+               "launch_angle", "total_spin", "attack_angle", "club_path", "face_angle",
+               "face_to_path", "impact_offset", "impact_height"]
 
 
 # ---------------------------------------------------------------------------
@@ -80,128 +81,134 @@ def apply_exclusions(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-QUALITY_TIERS  = ["Great", "Good", "Average", "Poor", "Miss"]
+QUALITY_TIERS  = ["Tour Quality", "Solid", "Playable", "Scramble", "Mishit"]
 QUALITY_COLORS = {
-    "Great":   "#2d6a4f",
-    "Good":    "#52b788",
-    "Average": "#f4a261",
-    "Poor":    "#e63946",
-    "Miss":    "#6b0504",
+    "Tour Quality": "#2d6a4f",
+    "Solid":        "#52b788",
+    "Playable":     "#f4a261",
+    "Scramble":     "#e63946",
+    "Mishit":       "#6b0504",
+}
+
+# PGA Tour carry benchmarks (yards) — fixed reference, not golfer-specific
+TOUR_CARRY = {
+    "Driver":         275, "3Wood": 243,  "3-Wood": 243,
+    "3Hybrid":        225, "3-Hybrid": 225,
+    "4Hybrid":        215, "4-Hybrid": 215,
+    "4Iron":          210, "4-Iron": 210,
+    "5Iron":          195, "5-Iron": 195,
+    "6Iron":          183, "6-Iron": 183,
+    "7Iron":          172, "7-Iron": 172,
+    "8Iron":          160, "8-Iron": 160,
+    "9Iron":          148, "9-Iron": 148,
+    "PitchingWedge":  136, "PW": 136,
+    "50Wedge":        120, "50° Wedge": 120,
+    "54Wedge":        103, "54° Wedge": 103,
+    "58Wedge":         86, "58° Wedge": 86,
+    "SandWedge":      115, "Sand Wedge": 115,
+}
+
+# PGA Tour average dispersion benchmarks (yards)
+TOUR_DISP = {
+    "Driver":         18, "3Wood": 14,  "3-Wood": 14,
+    "3Hybrid":        12, "3-Hybrid": 12,
+    "4Hybrid":        11, "4-Hybrid": 11,
+    "4Iron":          10, "4-Iron": 10,
+    "5Iron":           9, "5-Iron": 9,
+    "6Iron":           8, "6-Iron": 8,
+    "7Iron":           7, "7-Iron": 7,
+    "8Iron":           7, "8-Iron": 7,
+    "9Iron":           6, "9-Iron": 6,
+    "PitchingWedge":   6, "PW": 6,
+    "50Wedge":         5, "50° Wedge": 5,
+    "54Wedge":         5, "54° Wedge": 5,
+    "58Wedge":         5, "58° Wedge": 5,
+    "SandWedge":       5, "Sand Wedge": 5,
 }
 
 
-def _build_sqs_baselines(df: pd.DataFrame) -> dict:
-    """Build per-club SQS baselines (medians, IQR tolerances, optional regression)."""
-    baselines = {}
-    for club in df["club"].dropna().unique():
-        cd = df[df["club"] == club]
-        b: dict = {}
-
-        carry = cd["carry"].dropna()
-        if len(carry) >= 2:
-            b["median_carry"] = float(carry.median())
-            b["carry_tol"]    = max(float(carry.quantile(0.75) - carry.quantile(0.25)), 5.0)
-
-        offline = cd["offline"].dropna().abs()
-        if len(offline) >= 2:
-            b["offline_tol"] = max(float(offline.quantile(0.75) - offline.quantile(0.25)), 3.0)
-
-        baselines[club] = b
-    return baselines
+def _carry_score_vec(carry: np.ndarray, tour_carry: float) -> np.ndarray:
+    """Vectorised carry score using a power curve vs PGA Tour benchmark."""
+    pct   = carry / tour_carry
+    score = np.where(
+        pct >= 1.0, 100.0,
+        np.where(
+            pct <= 0.50, 0.0,
+            # np.maximum guards against negative base when pct < 0.5 in unevaluated branch
+            np.minimum(100.0, 100.0 * (np.maximum(0.0, pct - 0.50) / 0.50) ** 1.4),
+        ),
+    )
+    # Missing carry → 0
+    return np.where(np.isnan(carry), 0.0, score)
 
 
-def _apply_sqs(df: pd.DataFrame, baselines: dict) -> pd.DataFrame:
-    """Score each shot 0–100 with the SQS system.
+def _accuracy_score_vec(offline: np.ndarray, tour_disp: float) -> np.ndarray:
+    """Vectorised accuracy score using club-specific PGA Tour dispersion zones."""
+    x       = np.abs(offline)
+    tight   = tour_disp * 0.4
+    wide    = tour_disp * 2.5
+    extreme = tour_disp * 4.0
 
-    CarryScore (60%): how far relative to the club's median carry.
-    AccuracyScore (40%): how straight (offline vs club tolerance).
-
-    Adds columns: _sqs, _carry_score, _acc_score, _quality
-    """
-    df = df.copy()
-    for col in ["_sqs", "_carry_score", "_acc_score"]:
-        df[col] = np.nan
-    df["_quality"] = "Average"
-
-    for club, b in baselines.items():
-        if not b or "median_carry" not in b:
-            continue
-        mask = df["club"] == club
-        if not mask.any():
-            continue
-        idx = df.index[mask]
-        cd  = df.loc[idx]
-
-        carry = cd["carry"].values.astype(float)
-        off   = np.abs(cd["offline"].values.astype(float))
-
-        # ── Expected carry = club median (no speed adjustment) ────────────
-        exp_carry = np.full(len(cd), b["median_carry"])
-
-        # ── Component scores ──────────────────────────────────────────────
-        # CarryScore: 50 = hit your expected distance, 100 = 1 IQR above, 0 = 1 IQR below
-        carry_score = np.where(
-            ~np.isnan(carry),
-            np.clip(50 + 50 * (carry - exp_carry) / b["carry_tol"], 0, 100),
-            np.nan,
-        )
-
-        # AccuracyScore: 100 = dead straight, 0 = 2× offline tolerance
-        if "offline_tol" in b:
-            acc_score = np.where(
-                ~np.isnan(off),
-                np.clip(100 - 100 * off / (2 * b["offline_tol"]), 0, 100),
-                np.nan,
-            )
-        else:
-            acc_score = np.full(len(cd), np.nan)
-
-        # ── Weighted base score (redistribute if a component is missing) ──
-        w0    = np.where(~np.isnan(carry_score), 0.60, 0.0)
-        w1    = np.where(~np.isnan(acc_score),   0.40, 0.0)
-        tot_w = w0 + w1
-        base  = np.where(
-            tot_w > 0,
-            (np.where(~np.isnan(carry_score), carry_score, 0) * w0
-             + np.where(~np.isnan(acc_score),  acc_score,  0) * w1) / tot_w,
-            np.nan,
-        )
-
-        # ── Bonus: +5 if both ≥70, +3 more if both ≥85 ───────────────────
-        both = ~np.isnan(carry_score) & ~np.isnan(acc_score)
-        ge70 = both & (carry_score >= 70) & (acc_score >= 70)
-        ge85 = both & (carry_score >= 85) & (acc_score >= 85)
-        bonus = np.where(ge70, 5.0, 0.0) + np.where(ge85, 3.0, 0.0)
-
-        # ── Penalties: −8 extreme offline, −8 way short ───────────────────
-        off_tol = b.get("offline_tol", 1e9)
-        penalty = (np.where(~np.isnan(off)   & (off   > 3 * off_tol),       8.0, 0.0)
-                   + np.where(~np.isnan(carry) & (carry < 0.65 * exp_carry), 8.0, 0.0))
-
-        # ── Final SQS ─────────────────────────────────────────────────────
-        sqs = np.where(~np.isnan(base), np.clip(base + bonus - penalty, 0, 100), np.nan)
-
-        # ── Tier assignment ───────────────────────────────────────────────
-        sqs_s = pd.Series(sqs, index=idx)
-        q     = pd.Series("Average", index=idx)
-        q[sqs_s >= 75]                   = "Great"
-        q[(sqs_s >= 55) & (sqs_s < 75)] = "Good"
-        q[(sqs_s >= 35) & (sqs_s < 55)] = "Average"
-        q[(sqs_s >= 20) & (sqs_s < 35)] = "Poor"
-        q[sqs_s < 20]                    = "Miss"
-        q[sqs_s.isna()]                  = "Average"
-
-        df.loc[idx, "_sqs"]         = sqs
-        df.loc[idx, "_carry_score"] = carry_score
-        df.loc[idx, "_acc_score"]   = acc_score
-        df.loc[idx, "_quality"]     = q.values
-
-    return df
+    score = np.where(
+        x <= tight,
+        100.0,
+        np.where(
+            x <= tour_disp,
+            100.0 - ((x - tight) / (tour_disp - tight)) * 15.0,
+            np.where(
+                x <= wide,
+                85.0 - ((x - tour_disp) / (wide - tour_disp)) * 55.0,
+                np.where(
+                    x <= extreme,
+                    30.0 - ((x - wide) / (extreme - wide)) * 30.0,
+                    0.0,
+                ),
+            ),
+        ),
+    )
+    # Missing offline → 50
+    return np.where(np.isnan(offline), 50.0, score)
 
 
 def score_shot_quality(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute SQS for every shot in df using cross-session baselines."""
-    return _apply_sqs(df, _build_sqs_baselines(df))
+    """Score each shot 0–100 using fixed PGA Tour benchmarks.
+
+    SQS = 0.55 × CarryScore + 0.45 × AccuracyScore
+    Adds columns: _sqs, _carry_score, _acc_score, _quality
+    """
+    df = df.copy()
+    df["_sqs"]         = np.nan
+    df["_carry_score"] = np.nan
+    df["_acc_score"]   = np.nan
+    df["_quality"]     = "Playable"
+
+    for club in df["club"].dropna().unique():
+        tour_c = TOUR_CARRY.get(club)
+        tour_d = TOUR_DISP.get(club)
+        if tour_c is None or tour_d is None:
+            continue
+
+        idx   = df.index[df["club"] == club]
+        carry = df.loc[idx, "carry"].values.astype(float)
+        off   = df.loc[idx, "offline"].values.astype(float)
+
+        cs  = _carry_score_vec(carry, tour_c)
+        acc = _accuracy_score_vec(off, tour_d)
+        sqs = np.clip(0.55 * cs + 0.45 * acc, 0.0, 100.0)
+
+        q = pd.Series("Playable", index=idx)
+        q[sqs >= 80]                   = "Tour Quality"
+        q[(sqs >= 65) & (sqs < 80)]   = "Solid"
+        q[(sqs >= 45) & (sqs < 65)]   = "Playable"
+        q[(sqs >= 25) & (sqs < 45)]   = "Scramble"
+        q[sqs < 25]                    = "Mishit"
+
+        df.loc[idx, "_carry_score"] = cs
+        df.loc[idx, "_acc_score"]   = acc
+        df.loc[idx, "_sqs"]         = sqs
+        df.loc[idx, "_quality"]     = q.values
+
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +265,7 @@ quality_filter = st.sidebar.multiselect(
     help=(
         "SQS (0–100): Carry 60% · Accuracy 40%. "
         "Carry expectation adjusted for your actual club speed that swing. "
-        "Great ≥75 · Good ≥55 · Average ≥35 · Poor ≥20 · Miss <20"
+        "Tour Quality ≥80 · Solid ≥65 · Playable ≥45 · Scramble ≥25 · Mishit <25"
     ),
 )
 
@@ -266,6 +273,46 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
+
+# ── Export all shots to CSV ───────────────────────────────────────────────────
+@st.cache_data(ttl=60)
+def build_export_csv() -> bytes:
+    """Build a CSV of every shot from every session with all metrics + SQS."""
+    export_df = load_shots()
+    if export_df.empty:
+        return b""
+    export_df = apply_exclusions(export_df)
+    export_df = score_shot_quality(export_df)
+
+    # Friendly column ordering
+    meta_cols  = ["date", "title", "shot_number", "club", "excluded"]
+    score_cols = ["_sqs", "_quality"]
+    metric_cols_list = list(METRIC_LABELS.keys())
+    keep = [c for c in meta_cols + score_cols + metric_cols_list if c in export_df.columns]
+    out = export_df[keep].copy()
+
+    # Rename to human-readable headers
+    rename = {
+        "date":         "Date",
+        "title":        "Session",
+        "shot_number":  "Shot #",
+        "club":         "Club",
+        "excluded":     "Excluded",
+        "_sqs":         "SQS",
+        "_quality":     "Quality Tier",
+    }
+    rename.update({m: metric_col(m) for m in metric_cols_list})
+    out = out.rename(columns=rename)
+    out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
+    out = out.sort_values(["Date", "Shot #"])
+    return out.to_csv(index=False).encode("utf-8")
+
+st.sidebar.download_button(
+    label="⬇️ Export all shots (CSV)",
+    data=build_export_csv(),
+    file_name="trackman_shots.csv",
+    mime="text/csv",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -395,11 +442,9 @@ with tab_trends:
             st.markdown("---")
             st.subheader("Shot Quality Over Time")
             st.caption(
-                "**SQS (0–100):** Carry 60% + Accuracy 40%, "
-                "carry expectation adjusted for your actual club speed that swing. "
-                "Bonus +5 if both ≥70, +3 more if both ≥85. "
-                "Penalty −8 for extreme offline (>3× tolerance) or way short (<65% expected). "
-                "**Great** ≥75 · **Good** ≥55 · **Average** ≥35 · **Poor** ≥20 · **Miss** <20"
+                "**SQS (0–100):** 55% Carry + 45% Accuracy vs PGA Tour benchmarks. "
+                "A score of 70 means the shot was 70% as good as a Tour shot with that club. "
+                "**Tour Quality** ≥80 · **Solid** ≥65 · **Playable** ≥45 · **Scramble** ≥25 · **Mishit** <25"
             )
 
             qual_shots = chart_shots[chart_shots["_quality"].notna()]
@@ -465,11 +510,11 @@ with tab_trends:
                         labels={"session": "Session", "_sqs": "Avg SQS", "club": "Club"},
                         title="Average SQS Per Session by Club",
                     )
-                fig_sqs.add_hline(y=75, line_dash="dot", line_color="#2d6a4f",
-                                  annotation_text="Great", annotation_position="right",
+                fig_sqs.add_hline(y=80, line_dash="dot", line_color="#2d6a4f",
+                                  annotation_text="Tour Quality", annotation_position="right",
                                   opacity=0.6)
-                fig_sqs.add_hline(y=55, line_dash="dot", line_color="#52b788",
-                                  annotation_text="Good", annotation_position="right",
+                fig_sqs.add_hline(y=65, line_dash="dot", line_color="#52b788",
+                                  annotation_text="Solid", annotation_position="right",
                                   opacity=0.6)
                 fig_sqs.update_layout(
                     height=360, plot_bgcolor="white",
