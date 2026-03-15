@@ -124,9 +124,9 @@ Opens at [http://localhost:8501](http://localhost:8501).
 
 ## How sync works
 
-1. Browser opens `portal.trackmangolf.com` and intercepts the GraphQL response at `api.golf.trackman.com/graphql` to get the session list
-2. Each session's `reportLink` contains a UUID that acts as an auth token for the public report API
-3. Shot data is fetched directly from `golf-player-activities.trackmangolf.com/api/reports/getactivityreport` — no login required for this step
+1. A browser window opens and you log into your Trackman account normally
+2. The sync script reads your session list from the network responses the portal already loads for you
+3. Each session has a shareable report link — shot data is fetched from that link's public endpoint
 4. Speeds are converted from m/s → mph; all distances are already in yards
 
 ---
