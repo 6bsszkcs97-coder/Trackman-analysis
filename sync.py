@@ -78,6 +78,10 @@ def parse_and_save_report(report: dict, session_id: str) -> int:
         for stroke in group.get("Strokes", []):
             all_strokes.append(stroke)
 
+    # Sort by the per-stroke timestamp so shot_number reflects actual hit order.
+    # Trackman groups strokes by club in StrokeGroups, not chronologically.
+    all_strokes.sort(key=lambda s: s.get("Time") or "")
+
     for i, stroke in enumerate(all_strokes):
         shot_id = stroke.get("Id") or f"{session_id}_{i+1}"
         club = stroke.get("Club") or ""

@@ -116,6 +116,7 @@ def get_shots(session_id=None, club=None):
     query = f"""
         SELECT s.id AS session_id, s.date, s.title,
                sh.id, sh.shot_number, sh.club, sh.excluded,
+               json_extract(sh.raw_json, '$.Time') AS shot_time,
                {",".join(f"sh.{m}" for m in SHOT_METRICS)}
         FROM shots sh
         JOIN sessions s ON s.id = sh.session_id

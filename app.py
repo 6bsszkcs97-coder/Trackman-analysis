@@ -392,10 +392,59 @@ with tab_overview:
     overview["Sessions"] = overview["_n"].apply(
         lambda n: f"{n} combined" if n > 1 else "1"
     )
+    # Join avg SQS per date from chart_shots
+    if not chart_shots.empty and "_sqs" in chart_shots.columns:
+        _sqs_by_date = (
+            chart_shots.dropna(subset=["_sqs"]).copy()
+        )
+        _sqs_by_date["_date_str"] = _sqs_by_date["date"].dt.strftime("%Y-%m-%d")
+        _sqs_by_date = (
+            _sqs_by_date.groupby("_date_str")["_sqs"].mean().round(1).rename("Avg SQS")
+        )
+        overview = overview.join(_sqs_by_date, on="Date")
+        _overview_cols = ["Date", "Sessions", "Location", "Shots", "Avg SQS"]
+    else:
+        _overview_cols = ["Date", "Sessions", "Location", "Shots"]
     st.dataframe(
-        overview[["Date", "Sessions", "Location", "Shots"]],
+        overview[_overview_cols],
         use_container_width=True, hide_index=True,
     )
+
+    # ── Personal Records ──────────────────────────────────────────────────
+    if not chart_shots.empty:
+        st.markdown("---")
+        st.subheader("Personal Records")
+
+        pr_l, pr_r = st.columns(2)
+
+        with pr_l:
+            st.markdown("**All-time bests**")
+            _pr_metrics = [
+                ("_sqs",         "Best SQS",           "{:.1f}"),
+                ("ball_speed",   "Best Ball Speed",     "{:.1f} mph"),
+                ("club_speed",   "Best Club Speed",     "{:.1f} mph"),
+                ("smash_factor", "Best Smash Factor",   "{:.3f}"),
+                ("carry",        "Longest Carry",       "{:.1f} yds"),
+                ("total",        "Longest Total Dist",  "{:.1f} yds"),
+            ]
+            _pr_cols = st.columns(len(_pr_metrics))
+            for _i, (_m, _label, _fmt) in enumerate(_pr_metrics):
+                if _m in chart_shots.columns and chart_shots[_m].notna().any():
+                    _best = chart_shots[_m].max()
+                    _pr_cols[_i].metric(_label, _fmt.format(_best))
+
+        with pr_r:
+            st.markdown("**Best carry by club**")
+            if "carry" in chart_shots.columns:
+                _best_carry = (
+                    chart_shots.dropna(subset=["carry"])
+                    .groupby("club")["carry"]
+                    .max().reset_index()
+                    .rename(columns={"carry": "Best Carry (yds)"})
+                    .sort_values("Best Carry (yds)", ascending=False)
+                    .reset_index(drop=True)
+                )
+                st.dataframe(_best_carry, hide_index=True, use_container_width=True)
 
 
 # ============================================================
@@ -417,7 +466,13 @@ with tab_trends:
                 [m for m in KEY_METRICS if m in ts.columns],
                 format_func=metric_col)
             group_by_club = st.checkbox("Break out by club", value=True)
-            show_rolling  = st.checkbox("Show 3-session rolling avg", value=False)
+            show_rolling  = st.checkbox("Show rolling avg", value=False)
+            rolling_window = 3
+            if show_rolling and not group_by_club:
+                rolling_window = st.slider(
+                    "Window (sessions)", min_value=2, max_value=8, value=3,
+                    key="rolling_window",
+                )
 
         with col_right:
             if group_by_club:
@@ -436,13 +491,13 @@ with tab_trends:
                     .reset_index().sort_values("date")
                 )
                 if show_rolling:
-                    trend_df["rolling"] = trend_df[metric].rolling(3, min_periods=1).mean()
+                    trend_df["rolling"] = trend_df[metric].rolling(rolling_window, min_periods=1).mean()
                     fig = go.Figure()
                     fig.add_scatter(x=trend_df["date"], y=trend_df[metric],
                                     mode="markers+lines", name="Session avg",
                                     line=dict(color="#adb5bd"))
                     fig.add_scatter(x=trend_df["date"], y=trend_df["rolling"],
-                                    mode="lines", name="3-session avg",
+                                    mode="lines", name=f"{rolling_window}-session avg",
                                     line=dict(color="#2d6a4f", width=3))
                     fig.update_layout(title=f"{metric_col(metric)} Over Time",
                                       xaxis_title="Date", yaxis_title=metric_col(metric))
@@ -586,10 +641,12 @@ with tab_trends:
                         .sort_values("date")
                     )
                     sqs_trend["session"] = sqs_trend["date"].dt.strftime("%m/%d/%y")
+                    _sqs_club_order = sqs_trend["session"].unique().tolist()
                     fig_sqs = px.line(
                         sqs_trend, x="session", y="_sqs", color="club", markers=True,
                         labels={"session": "Session", "_sqs": "Avg SQS", "club": "Club"},
                         title="Average SQS Per Session by Club",
+                        category_orders={"session": _sqs_club_order},
                     )
                 # Coloured tier bands (bottom to top)
                 tier_bands = [
@@ -669,8 +726,34 @@ with tab_session:
         else:
             sess_clean = session_shots[~session_shots["_excluded"]]
 
+            # ── Previous-session baseline for delta ──────────────────────────
+            _prev_means: dict = {}
+            if not multi_session and not session_shots.empty:
+                _sel_date = session_shots["date"].min()
+                _prev_sess = sessions_df[sessions_df["date"] < _sel_date].sort_values(
+                    "date", ascending=False
+                )
+                if not _prev_sess.empty:
+                    _prev_raw = load_shots(session_id=_prev_sess.iloc[0]["id"])
+                    if not _prev_raw.empty:
+                        _prev_raw = apply_exclusions(_prev_raw)
+                        _prev_raw = score_shot_quality(_prev_raw)
+                        _prev_clean = _prev_raw[~_prev_raw["_excluded"]]
+                        for _pm in KEY_METRICS + ["_sqs"]:
+                            if _pm in _prev_clean.columns and _prev_clean[_pm].notna().any():
+                                _prev_means[_pm] = _prev_clean[_pm].mean()
+
+            def _delta(m, cur_val):
+                """Return delta string vs previous session, or None."""
+                if m not in _prev_means or pd.isna(_prev_means[m]) or pd.isna(cur_val):
+                    return None
+                diff = cur_val - _prev_means[m]
+                return f"{diff:+.1f} vs prev"
+
             # ── Averages ────────────────────────────────────────────────────
             st.markdown("#### Averages")
+            if _prev_means:
+                st.caption("Δ vs previous session shown below each metric.")
             avail = [m for m in KEY_METRICS
                      if m in sess_clean.columns and sess_clean[m].notna().any()]
 
@@ -682,10 +765,17 @@ with tab_session:
 
             col_idx = 0
             if avg_sqs is not None and not pd.isna(avg_sqs):
-                metric_cols[col_idx % 5].metric("Avg SQS", f"{avg_sqs:.1f}")
+                metric_cols[col_idx % 5].metric(
+                    "Avg SQS", f"{avg_sqs:.1f}",
+                    delta=_delta("_sqs", avg_sqs),
+                )
                 col_idx += 1
             for m in avail[:10]:
-                metric_cols[col_idx % 5].metric(metric_col(m), fmt_metric(sess_clean[m].mean(), m))
+                cur = sess_clean[m].mean()
+                metric_cols[col_idx % 5].metric(
+                    metric_col(m), fmt_metric(cur, m),
+                    delta=_delta(m, cur), delta_color="off",
+                )
                 col_idx += 1
 
             n_sess_excl = int(session_shots["_excluded"].sum())
@@ -736,6 +826,65 @@ with tab_session:
                         title=f"{scatter_metric_label(x_metric)} vs {scatter_metric_label(y_metric)}")
                 fig.update_layout(height=520, plot_bgcolor="white")
                 st.plotly_chart(fig, use_container_width=True)
+
+            # ── Shot sequence chart ───────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("Shot Sequence")
+            st.caption(
+                "Metric values in shot order — reveals warm-up effects, fatigue, or hot streaks within a session."
+            )
+            seq_l, seq_r = st.columns([1, 3])
+            with seq_l:
+                seq_metric = st.selectbox(
+                    "Metric", avail_all,
+                    index=avail_all.index("_sqs") if "_sqs" in avail_all else 0,
+                    format_func=scatter_metric_label,
+                    key="seq_metric",
+                )
+                seq_color_by = st.radio(
+                    "Color by", ["Club", "Quality Tier"],
+                    horizontal=True, key="seq_color_by",
+                )
+            with seq_r:
+                # Sort by actual shot timestamp when available (Trackman groups strokes
+                # by club in StrokeGroups, not chronologically, so shot_number alone is
+                # unreliable for existing data — run sync.py --all to fix permanently).
+                _seq_df = sess_clean.copy()
+                if "shot_time" in _seq_df.columns and _seq_df["shot_time"].notna().any():
+                    _seq_df["_sort_key"] = pd.to_datetime(_seq_df["shot_time"], errors="coerce")
+                    _seq_df = _seq_df.sort_values("_sort_key").reset_index(drop=True)
+                else:
+                    _seq_df = _seq_df.sort_values("shot_number").reset_index(drop=True)
+                _seq_df["_seq_pos"] = range(1, len(_seq_df) + 1)
+                if not _seq_df.empty:
+                    if seq_color_by == "Club":
+                        fig_seq = px.scatter(
+                            _seq_df, x="_seq_pos", y=seq_metric, color="club",
+                            labels={"_seq_pos": "Shot #", seq_metric: scatter_metric_label(seq_metric)},
+                            title=f"{scatter_metric_label(seq_metric)} by Shot Order",
+                        )
+                    else:
+                        fig_seq = px.scatter(
+                            _seq_df, x="_seq_pos", y=seq_metric, color="_quality",
+                            color_discrete_map=QUALITY_COLORS,
+                            category_orders={"_quality": QUALITY_TIERS},
+                            labels={"_seq_pos": "Shot #", seq_metric: scatter_metric_label(seq_metric),
+                                    "_quality": "Tier"},
+                            title=f"{scatter_metric_label(seq_metric)} by Shot Order",
+                        )
+                    # Rolling mean trend line (skip if too few non-null values)
+                    _seq_valid = _seq_df[seq_metric].notna()
+                    if _seq_valid.sum() >= 3:
+                        _win = max(3, int(_seq_valid.sum()) // 8)
+                        _seq_df["_roll"] = _seq_df[seq_metric].rolling(_win, center=True, min_periods=1).mean()
+                        fig_seq.add_scatter(
+                            x=_seq_df["_seq_pos"], y=_seq_df["_roll"],
+                            mode="lines", name=f"{_win}-shot avg",
+                            line=dict(color="#555555", width=2, dash="dash"),
+                            showlegend=True,
+                        )
+                    fig_seq.update_layout(height=380, plot_bgcolor="white")
+                    st.plotly_chart(fig_seq, use_container_width=True)
 
             st.markdown("---")
 
@@ -858,29 +1007,6 @@ with tab_clubs:
             full_agg.columns = ["Club"] + [metric_col(m) for m in avail_metrics]
         st.dataframe(full_agg.set_index("Club"), use_container_width=True)
 
-        radar_metrics = ["ball_speed", "club_speed", "smash_factor",
-                          "carry", "launch_angle", "total_spin"]
-        radar_avail = [m for m in radar_metrics
-                       if m in chart_shots.columns and chart_shots[m].notna().any()]
-        if len(radar_avail) >= 3:
-            st.subheader("Club Profile (Radar)")
-            top_clubs_df = (
-                chart_shots[chart_shots["club"] != ""]
-                .groupby("club")["club"].count().nlargest(6)
-            )
-            radar_df = (
-                chart_shots[chart_shots["club"].isin(top_clubs_df.index)]
-                .groupby("club")[radar_avail].mean()
-            )
-            normed = (radar_df - radar_df.min()) / (radar_df.max() - radar_df.min() + 1e-9)
-            fig_r = go.Figure()
-            for club in normed.index:
-                vals = normed.loc[club].tolist() + [normed.loc[club].tolist()[0]]
-                cats = [metric_col(m) for m in radar_avail] + [metric_col(radar_avail[0])]
-                fig_r.add_trace(go.Scatterpolar(r=vals, theta=cats, fill="toself", name=club))
-            fig_r.update_layout(polar=dict(radialaxis=dict(visible=False)),
-                                 height=450, title="Club Profiles (normalised)")
-            st.plotly_chart(fig_r, use_container_width=True)
 
 
 # ============================================================
@@ -1518,49 +1644,63 @@ with tab_quality:
                         )
                         st.plotly_chart(fig_qa, use_container_width=True)
 
-            # ── Radar: normalised tier fingerprints ───────────────────────────
-            radar_pool = [
-                m for m in qa_metrics
-                if m in ["face_to_path", "club_path", "face_angle", "attack_angle",
-                         "dynamic_loft", "impact_offset", "impact_height",
-                         "smash_factor", "launch_angle", "spin_axis"]
-            ]
-            if len(radar_pool) >= 3:
-                st.markdown("---")
-                st.subheader("Tier Fingerprints (Radar)")
-                st.caption(
-                    "Each axis is the absolute average of that metric per tier, "
-                    "normalised 0–1 across tiers. Use this to spot the overall "
-                    "swing signature of each quality category."
-                )
-                tier_abs_means = (
-                    qa_df.groupby("_display_quality", observed=True)[radar_pool]
-                    .mean().abs()
-                    .reindex(present_tiers)
-                )
-                tier_radar_norm = tier_abs_means.copy()
-                for col in tier_radar_norm.columns:
-                    mn, mx = tier_radar_norm[col].min(), tier_radar_norm[col].max()
-                    tier_radar_norm[col] = (tier_radar_norm[col] - mn) / (mx - mn + 1e-9)
+            # ── Correlation matrix: metrics vs SQS by club ────────────────────
+            st.markdown("---")
+            st.subheader("Metric Correlations with SQS")
+            st.caption(
+                "Pearson r of each swing metric against Shot Quality Score, computed per club. "
+                "Strong positive r → metric rises with shot quality. "
+                "Strong negative r → lower (or closer-to-zero) values tend to accompany better shots. "
+                "Grey cells have too few shots to compute reliably (< 10)."
+            )
+            _corr_pool = [m for m in qa_metric_pool if m in qa_base.columns]
+            _corr_source = qa_base.dropna(subset=["_sqs"])
+            if qa_clubs:
+                _corr_source = _corr_source[_corr_source["club"].isin(qa_clubs)]
 
-                radar_cats = [metric_col(m) for m in radar_pool]
-                fig_radar = go.Figure()
-                for tier in present_tiers:
-                    vals = tier_radar_norm.loc[tier].tolist()
-                    _tier_color = display_colors.get(tier, "#333333")
-                    fig_radar.add_trace(go.Scatterpolar(
-                        r=vals + [vals[0]],
-                        theta=radar_cats + [radar_cats[0]],
-                        fill="toself",
-                        name=tier,
-                        line_color=_tier_color,
-                        fillcolor=_tier_color,
-                        opacity=0.25,
-                    ))
-                fig_radar.update_layout(
-                    polar=dict(radialaxis=dict(visible=True, range=[0, 1], showticklabels=False)),
-                    height=500,
-                    showlegend=True,
-                    title="Swing Fingerprint per Quality Tier (normalised absolute averages)",
-                )
-                st.plotly_chart(fig_radar, use_container_width=True)
+            _corr_clubs = sorted(_corr_source["club"].dropna().unique().tolist())
+            _corr_cols  = ["Overall"] + _corr_clubs
+
+            _corr_matrix: dict = {}
+            for _cc in _corr_cols:
+                _cd = _corr_source if _cc == "Overall" else _corr_source[_corr_source["club"] == _cc]
+                _row: dict = {}
+                for _cm in _corr_pool:
+                    _pair = _cd[["_sqs", _cm]].dropna()
+                    if len(_pair) >= 10:
+                        _row[_cm] = round(float(_pair.corr().loc["_sqs", _cm]), 2)
+                    else:
+                        _row[_cm] = np.nan
+                _corr_matrix[_cc] = _row
+
+            _corr_df = pd.DataFrame(_corr_matrix, index=_corr_pool)   # metrics × clubs
+            _corr_display = _corr_df.rename(index={m: metric_col(m) for m in _corr_pool})
+
+            fig_corr = px.imshow(
+                _corr_display,
+                color_continuous_scale="RdBu",
+                zmin=-1, zmax=1,
+                aspect="auto",
+                title="Pearson r (metric vs SQS)  —  blue = positive correlation, red = negative",
+                labels=dict(x="Club", y="Metric", color="r"),
+            )
+            # Annotate cells with r value
+            _corr_annots = []
+            for _ci, _cc in enumerate(_corr_cols):
+                for _ri, _cm in enumerate(_corr_pool):
+                    _rv = _corr_matrix[_cc].get(_cm, np.nan)
+                    if not pd.isna(_rv):
+                        _corr_annots.append(dict(
+                            x=_cc, y=metric_col(_cm),
+                            text=f"{_rv:.2f}",
+                            showarrow=False,
+                            font=dict(size=10, color="black"),
+                        ))
+            fig_corr.update_layout(
+                height=max(280, 45 * len(_corr_pool)),
+                annotations=_corr_annots,
+                coloraxis_colorbar=dict(title="r"),
+                plot_bgcolor="white",
+                xaxis=dict(side="top"),
+            )
+            st.plotly_chart(fig_corr, use_container_width=True)
