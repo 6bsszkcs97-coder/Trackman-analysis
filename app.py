@@ -352,8 +352,8 @@ if quality_filter and len(quality_filter) < len(QUALITY_TIERS) and not chart_sho
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_overview, tab_trends, tab_session, tab_clubs, tab_dispersion = st.tabs(
-    ["📋 Sessions", "📈 Trends", "🎯 Session Detail", "🏌️ Club Stats", "🗺️ Dispersion"]
+tab_overview, tab_trends, tab_session, tab_clubs, tab_dispersion, tab_quality = st.tabs(
+    ["📋 Sessions", "📈 Trends", "🎯 Session Detail", "🏌️ Club Stats", "🗺️ Dispersion", "🔬 Quality Analysis"]
 )
 
 
@@ -1228,3 +1228,275 @@ with tab_dispersion:
                                       annotation_text="Center", annotation_position="right")
                     fig_hgt.update_layout(height=300, plot_bgcolor="white")
                     st.plotly_chart(fig_hgt, use_container_width=True)
+
+
+# ============================================================
+# TAB 6 – Quality Analysis
+# ============================================================
+with tab_quality:
+    st.header("Shot Quality Analysis")
+    st.caption(
+        "Compare swing characteristics across quality tiers to understand "
+        "what separates your best shots from your worst."
+    )
+
+    # Use all non-excluded shots — ignore sidebar quality filter so all tiers are visible
+    qa_base = all_shots[~all_shots["_excluded"]].copy()
+
+    if qa_base.empty or "_quality" not in qa_base.columns or qa_base["_quality"].isna().all():
+        st.info("No quality data available. Make sure shots have been synced and scored.")
+    else:
+        # ── Controls ──────────────────────────────────────────────────────────
+        qa_ctrl_l, qa_ctrl_r = st.columns([1, 2])
+
+        with qa_ctrl_l:
+            qa_clubs_avail = sorted(qa_base["club"].dropna().unique().tolist())
+            qa_clubs = st.multiselect(
+                "Filter by club",
+                qa_clubs_avail,
+                default=qa_clubs_avail,
+                key="qa_clubs",
+                help="Restrict the analysis to specific clubs, or leave all selected for a full-bag view.",
+            )
+
+        # Metrics available in the data — swing-first ordering
+        _QA_METRIC_ORDER = [
+            "face_to_path", "club_path", "face_angle", "attack_angle",
+            "dynamic_loft", "spin_axis", "launch_direction",
+            "impact_offset", "impact_height",
+            "smash_factor", "launch_angle", "ball_speed", "club_speed",
+            "total_spin", "carry",
+        ]
+        qa_metric_pool = [
+            m for m in _QA_METRIC_ORDER
+            if m in qa_base.columns and qa_base[m].notna().any()
+        ]
+        qa_defaults = [
+            m for m in [
+                "face_to_path", "club_path", "face_angle", "attack_angle",
+                "dynamic_loft", "impact_offset", "impact_height", "smash_factor",
+            ] if m in qa_metric_pool
+        ]
+
+        with qa_ctrl_r:
+            qa_metrics = st.multiselect(
+                "Metrics to analyse",
+                qa_metric_pool,
+                default=qa_defaults,
+                format_func=metric_col,
+                key="qa_metrics",
+            )
+
+        qa_chart_type = st.radio(
+            "Chart style", ["Box", "Violin", "Bar (mean ± std)"],
+            key="qa_chart_type", horizontal=True,
+        )
+
+        if not qa_clubs or not qa_metrics:
+            st.info("Select at least one club and one metric to begin.")
+        else:
+            qa_df = qa_base[
+                qa_base["club"].isin(qa_clubs) &
+                qa_base["_quality"].notna()
+            ].copy()
+            qa_df["_quality"] = pd.Categorical(
+                qa_df["_quality"], categories=QUALITY_TIERS, ordered=True
+            )
+
+            # ── Tier summary KPIs ─────────────────────────────────────────────
+            st.markdown("---")
+            total_qa = len(qa_df)
+            tier_summary = (
+                qa_df.groupby("_quality", observed=False)
+                .agg(n=("_sqs", "count"), avg_sqs=("_sqs", "mean"))
+            )
+            kpi_cols = st.columns(len(QUALITY_TIERS))
+            for i, tier in enumerate(QUALITY_TIERS):
+                n   = int(tier_summary.loc[tier, "n"])   if tier in tier_summary.index else 0
+                avg = tier_summary.loc[tier, "avg_sqs"] if tier in tier_summary.index else None
+                pct = n / total_qa * 100 if total_qa > 0 else 0
+                delta = f"Avg SQS {avg:.1f}" if (avg is not None and not pd.isna(avg) and n > 0) else "–"
+                kpi_cols[i].metric(
+                    tier,
+                    f"{n:,} shots  ({pct:.0f}%)",
+                    delta,
+                )
+
+            # ── Heatmap overview ──────────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("Average Values by Tier")
+
+            present_tiers = [t for t in QUALITY_TIERS if t in qa_df["_quality"].unique()]
+            heat_means = (
+                qa_df.groupby("_quality", observed=True)[qa_metrics]
+                .mean()
+                .reindex(present_tiers)
+            )
+
+            # Metric direction rules for colour encoding
+            # "abs_lower": best when absolute value is smallest (on-target / centred)
+            # "higher":    best when raw value is highest (power/efficiency metrics)
+            _ABS_LOWER_BETTER = {
+                "face_to_path", "club_path", "face_angle",
+                "impact_offset", "impact_height",
+                "spin_axis", "launch_direction", "attack_angle",
+            }
+            _HIGHER_BETTER = {
+                "smash_factor", "ball_speed", "club_speed", "carry",
+            }
+
+            # Build a normalised colour matrix where green always = better
+            heat_norm_cols = {}
+            for m in qa_metrics:
+                col = heat_means[m]
+                if m in _ABS_LOWER_BETTER:
+                    # Colour based on absolute deviation; invert so smaller abs = greener
+                    abs_col = col.abs()
+                    abs_mn, abs_mx = abs_col.min(), abs_col.max()
+                    heat_norm_cols[m] = 1.0 - (abs_col - abs_mn) / (abs_mx - abs_mn + 1e-9)
+                elif m in _HIGHER_BETTER:
+                    mn, mx = col.min(), col.max()
+                    heat_norm_cols[m] = (col - mn) / (mx - mn + 1e-9)
+                else:
+                    # Neutral: show gradient without strong directional claim
+                    mn, mx = col.min(), col.max()
+                    heat_norm_cols[m] = (col - mn) / (mx - mn + 1e-9)
+
+            heat_norm_df = pd.DataFrame(heat_norm_cols, index=present_tiers)
+            heat_norm_display = heat_norm_df.rename(columns={m: metric_col(m) for m in qa_metrics})
+
+            fig_heat = px.imshow(
+                heat_norm_display.T,
+                color_continuous_scale="RdYlGn",
+                aspect="auto",
+                title="Metric Averages by Quality Tier  (green = better, direction-aware per metric)",
+                labels=dict(x="Quality Tier", y="Metric", color="Score"),
+            )
+            # Overlay actual signed averages as annotation text
+            heat_annotations = []
+            for c_i, tier in enumerate(present_tiers):
+                for r_i, m in enumerate(qa_metrics):
+                    val = heat_means.loc[tier, m]
+                    if not pd.isna(val):
+                        heat_annotations.append(dict(
+                            x=tier, y=metric_col(m),
+                            text=f"{val:.2f}",
+                            showarrow=False,
+                            font=dict(size=10, color="black"),
+                        ))
+            fig_heat.update_layout(
+                height=max(280, 52 * len(qa_metrics)),
+                annotations=heat_annotations,
+                coloraxis_showscale=False,
+                plot_bgcolor="white",
+                xaxis=dict(side="top"),
+            )
+            st.plotly_chart(fig_heat, use_container_width=True)
+            st.caption(
+                "🟢 **Green = better** for each metric individually. "
+                "Deviation metrics (Face to Path, Club Path, Face Angle, Impact Offset/Height, etc.) "
+                "— colour based on absolute value, so closer to 0 is greener. "
+                "Performance metrics (Smash Factor, Ball Speed, Carry) — higher is greener. "
+                "Numbers show actual signed averages."
+            )
+
+            # ── Per-metric distribution charts ────────────────────────────────
+            st.markdown("---")
+            st.subheader("Distribution by Tier")
+
+            for row_i in range(0, len(qa_metrics), 2):
+                grid_cols = st.columns(2)
+                for col_j, m in enumerate(qa_metrics[row_i:row_i + 2]):
+                    m_df = qa_df.dropna(subset=[m])
+                    if m_df.empty:
+                        continue
+                    with grid_cols[col_j]:
+                        if qa_chart_type == "Box":
+                            fig_qa = px.box(
+                                m_df, x="_quality", y=m,
+                                color="_quality",
+                                color_discrete_map=QUALITY_COLORS,
+                                category_orders={"_quality": QUALITY_TIERS},
+                                points="outliers",
+                                labels={"_quality": "", m: metric_col(m)},
+                                title=metric_col(m),
+                            )
+                        elif qa_chart_type == "Violin":
+                            fig_qa = px.violin(
+                                m_df, x="_quality", y=m,
+                                color="_quality",
+                                color_discrete_map=QUALITY_COLORS,
+                                category_orders={"_quality": QUALITY_TIERS},
+                                box=True, points="outliers",
+                                labels={"_quality": "", m: metric_col(m)},
+                                title=metric_col(m),
+                            )
+                        else:  # Bar mean ± std
+                            bar_agg = (
+                                m_df.groupby("_quality", observed=False)[m]
+                                .agg(mean="mean", std="std")
+                                .reindex(QUALITY_TIERS).reset_index()
+                            )
+                            fig_qa = px.bar(
+                                bar_agg, x="_quality", y="mean", error_y="std",
+                                color="_quality",
+                                color_discrete_map=QUALITY_COLORS,
+                                category_orders={"_quality": QUALITY_TIERS},
+                                labels={"_quality": "", "mean": metric_col(m)},
+                                title=metric_col(m),
+                                text="mean",
+                            )
+                            fig_qa.update_traces(
+                                texttemplate="%{text:.2f}", textposition="outside"
+                            )
+                        fig_qa.update_layout(
+                            height=380, plot_bgcolor="white",
+                            showlegend=False, xaxis_title="",
+                        )
+                        st.plotly_chart(fig_qa, use_container_width=True)
+
+            # ── Radar: normalised tier fingerprints ───────────────────────────
+            radar_pool = [
+                m for m in qa_metrics
+                if m in ["face_to_path", "club_path", "face_angle", "attack_angle",
+                         "dynamic_loft", "impact_offset", "impact_height",
+                         "smash_factor", "launch_angle", "spin_axis"]
+            ]
+            if len(radar_pool) >= 3:
+                st.markdown("---")
+                st.subheader("Tier Fingerprints (Radar)")
+                st.caption(
+                    "Each axis is the absolute average of that metric per tier, "
+                    "normalised 0–1 across tiers. Use this to spot the overall "
+                    "swing signature of each quality category."
+                )
+                tier_abs_means = (
+                    qa_df.groupby("_quality", observed=True)[radar_pool]
+                    .mean().abs()
+                    .reindex(present_tiers)
+                )
+                tier_radar_norm = tier_abs_means.copy()
+                for col in tier_radar_norm.columns:
+                    mn, mx = tier_radar_norm[col].min(), tier_radar_norm[col].max()
+                    tier_radar_norm[col] = (tier_radar_norm[col] - mn) / (mx - mn + 1e-9)
+
+                radar_cats = [metric_col(m) for m in radar_pool]
+                fig_radar = go.Figure()
+                for tier in present_tiers:
+                    vals = tier_radar_norm.loc[tier].tolist()
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=vals + [vals[0]],
+                        theta=radar_cats + [radar_cats[0]],
+                        fill="toself",
+                        name=tier,
+                        line_color=QUALITY_COLORS[tier],
+                        fillcolor=QUALITY_COLORS[tier],
+                        opacity=0.25,
+                    ))
+                fig_radar.update_layout(
+                    polar=dict(radialaxis=dict(visible=True, range=[0, 1], showticklabels=False)),
+                    height=500,
+                    showlegend=True,
+                    title="Swing Fingerprint per Quality Tier (normalised absolute averages)",
+                )
+                st.plotly_chart(fig_radar, use_container_width=True)
