@@ -32,7 +32,7 @@ A personal analytics dashboard for [Trackman](https://www.trackman.com/) golf da
 ## Shot Quality Score (SQS)
 
 ```
-SQS = (0.55 × Carry Score) + (0.45 × Accuracy Score)
+SQS = (0.60 × Carry Score) + (0.40 × Accuracy Score)
 ```
 
 **Carry Score** — actual carry vs PGA Tour average for that club, on a power curve (exponent 1.4). 100% of tour carry = 100. 50% or below = 0.
@@ -128,6 +128,10 @@ Opens at [http://localhost:8501](http://localhost:8501).
 2. The sync script reads your session list from the network responses the portal already loads for you
 3. Each session has a shareable report link — shot data is fetched from that link's public endpoint
 4. Speeds are converted from m/s → mph; all distances are already in yards
+
+**Supported activity types**
+
+Only **Shot Analysis** sessions are synced. Other activity types (virtual rounds, simulated courses, etc.) are not currently supported and will be silently skipped during sync — they won't appear in the dashboard. You can inspect `data/raw/*.json` to see what `kind` values your account contains if you want to understand what's being filtered out.
 
 ---
 

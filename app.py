@@ -1292,6 +1292,38 @@ with tab_quality:
             key="qa_chart_type", horizontal=True,
         )
 
+        # ── Tier grouping controls ─────────────────────────────────────────
+        use_groups = False
+        grp_a_name, grp_b_name = "Upper", "Lower"
+        grp_a_tiers: list = []
+        grp_b_tiers: list = []
+        with st.expander("🔗 Group tiers (optional)", expanded=False):
+            use_groups = st.checkbox(
+                "Combine tiers into custom groups",
+                value=False,
+                key="qa_use_groups",
+                help="Merge quality tiers into two named groups for side-by-side comparison.",
+            )
+            if use_groups:
+                grp_col1, grp_col2 = st.columns(2)
+                with grp_col1:
+                    grp_a_name = st.text_input("Group A name", "Upper", key="qa_grp_a_name")
+                    grp_a_tiers = st.multiselect(
+                        "Group A tiers",
+                        QUALITY_TIERS,
+                        default=["Tour Quality", "Solid"],
+                        key="qa_grp_a_tiers",
+                    )
+                with grp_col2:
+                    grp_b_name = st.text_input("Group B name", "Lower", key="qa_grp_b_name")
+                    grp_b_tiers = st.multiselect(
+                        "Group B tiers",
+                        QUALITY_TIERS,
+                        default=["Playable", "Scramble", "Mishit"],
+                        key="qa_grp_b_tiers",
+                    )
+                st.caption("Tiers not assigned to either group are excluded from the grouped view.")
+
         if not qa_clubs or not qa_metrics:
             st.info("Select at least one club and one metric to begin.")
         else:
@@ -1303,15 +1335,42 @@ with tab_quality:
                 qa_df["_quality"], categories=QUALITY_TIERS, ordered=True
             )
 
+            # ── Resolve display tiers (individual or grouped) ─────────────────
+            if use_groups and (grp_a_tiers or grp_b_tiers):
+                _tier_map: dict = {}
+                for _t in grp_a_tiers:
+                    _tier_map[_t] = grp_a_name or "Group A"
+                for _t in grp_b_tiers:
+                    _tier_map[_t] = grp_b_name or "Group B"
+                qa_df["_display_quality"] = qa_df["_quality"].map(_tier_map)
+                qa_df = qa_df[qa_df["_display_quality"].notna()].copy()
+                # Ordered: Group A first, then Group B (deduplicated)
+                display_tiers: list = []
+                for _n in [grp_a_name or "Group A", grp_b_name or "Group B"]:
+                    if _n not in display_tiers:
+                        display_tiers.append(_n)
+                _grp_palette = ["#1d6fb8", "#e36200"]   # blue / orange
+                display_colors: dict = {
+                    display_tiers[i]: _grp_palette[i % len(_grp_palette)]
+                    for i in range(len(display_tiers))
+                }
+            else:
+                qa_df["_display_quality"] = qa_df["_quality"].astype(str)
+                display_tiers = list(QUALITY_TIERS)
+                display_colors = dict(QUALITY_COLORS)
+            qa_df["_display_quality"] = pd.Categorical(
+                qa_df["_display_quality"], categories=display_tiers, ordered=True
+            )
+
             # ── Tier summary KPIs ─────────────────────────────────────────────
             st.markdown("---")
             total_qa = len(qa_df)
             tier_summary = (
-                qa_df.groupby("_quality", observed=False)
+                qa_df.groupby("_display_quality", observed=False)
                 .agg(n=("_sqs", "count"), avg_sqs=("_sqs", "mean"))
             )
-            kpi_cols = st.columns(len(QUALITY_TIERS))
-            for i, tier in enumerate(QUALITY_TIERS):
+            kpi_cols = st.columns(len(display_tiers))
+            for i, tier in enumerate(display_tiers):
                 n   = int(tier_summary.loc[tier, "n"])   if tier in tier_summary.index else 0
                 avg = tier_summary.loc[tier, "avg_sqs"] if tier in tier_summary.index else None
                 pct = n / total_qa * 100 if total_qa > 0 else 0
@@ -1326,9 +1385,9 @@ with tab_quality:
             st.markdown("---")
             st.subheader("Average Values by Tier")
 
-            present_tiers = [t for t in QUALITY_TIERS if t in qa_df["_quality"].unique()]
+            present_tiers = [t for t in display_tiers if t in qa_df["_display_quality"].unique()]
             heat_means = (
-                qa_df.groupby("_quality", observed=True)[qa_metrics]
+                qa_df.groupby("_display_quality", observed=True)[qa_metrics]
                 .mean()
                 .reindex(present_tiers)
             )
@@ -1362,7 +1421,11 @@ with tab_quality:
                     mn, mx = col.min(), col.max()
                     heat_norm_cols[m] = (col - mn) / (mx - mn + 1e-9)
 
-            heat_norm_df = pd.DataFrame(heat_norm_cols, index=present_tiers)
+            # Compress values into [0.18, 0.82] so colours stay pastel and numbers are legible
+            heat_norm_df = pd.DataFrame(
+                {m: 0.18 + v * 0.64 for m, v in heat_norm_cols.items()},
+                index=present_tiers,
+            )
             heat_norm_display = heat_norm_df.rename(columns={m: metric_col(m) for m in qa_metrics})
 
             fig_heat = px.imshow(
@@ -1413,36 +1476,36 @@ with tab_quality:
                     with grid_cols[col_j]:
                         if qa_chart_type == "Box":
                             fig_qa = px.box(
-                                m_df, x="_quality", y=m,
-                                color="_quality",
-                                color_discrete_map=QUALITY_COLORS,
-                                category_orders={"_quality": QUALITY_TIERS},
+                                m_df, x="_display_quality", y=m,
+                                color="_display_quality",
+                                color_discrete_map=display_colors,
+                                category_orders={"_display_quality": display_tiers},
                                 points="outliers",
-                                labels={"_quality": "", m: metric_col(m)},
+                                labels={"_display_quality": "", m: metric_col(m)},
                                 title=metric_col(m),
                             )
                         elif qa_chart_type == "Violin":
                             fig_qa = px.violin(
-                                m_df, x="_quality", y=m,
-                                color="_quality",
-                                color_discrete_map=QUALITY_COLORS,
-                                category_orders={"_quality": QUALITY_TIERS},
+                                m_df, x="_display_quality", y=m,
+                                color="_display_quality",
+                                color_discrete_map=display_colors,
+                                category_orders={"_display_quality": display_tiers},
                                 box=True, points="outliers",
-                                labels={"_quality": "", m: metric_col(m)},
+                                labels={"_display_quality": "", m: metric_col(m)},
                                 title=metric_col(m),
                             )
                         else:  # Bar mean ± std
                             bar_agg = (
-                                m_df.groupby("_quality", observed=False)[m]
+                                m_df.groupby("_display_quality", observed=False)[m]
                                 .agg(mean="mean", std="std")
-                                .reindex(QUALITY_TIERS).reset_index()
+                                .reindex(display_tiers).reset_index()
                             )
                             fig_qa = px.bar(
-                                bar_agg, x="_quality", y="mean", error_y="std",
-                                color="_quality",
-                                color_discrete_map=QUALITY_COLORS,
-                                category_orders={"_quality": QUALITY_TIERS},
-                                labels={"_quality": "", "mean": metric_col(m)},
+                                bar_agg, x="_display_quality", y="mean", error_y="std",
+                                color="_display_quality",
+                                color_discrete_map=display_colors,
+                                category_orders={"_display_quality": display_tiers},
+                                labels={"_display_quality": "", "mean": metric_col(m)},
                                 title=metric_col(m),
                                 text="mean",
                             )
@@ -1471,7 +1534,7 @@ with tab_quality:
                     "swing signature of each quality category."
                 )
                 tier_abs_means = (
-                    qa_df.groupby("_quality", observed=True)[radar_pool]
+                    qa_df.groupby("_display_quality", observed=True)[radar_pool]
                     .mean().abs()
                     .reindex(present_tiers)
                 )
@@ -1484,13 +1547,14 @@ with tab_quality:
                 fig_radar = go.Figure()
                 for tier in present_tiers:
                     vals = tier_radar_norm.loc[tier].tolist()
+                    _tier_color = display_colors.get(tier, "#333333")
                     fig_radar.add_trace(go.Scatterpolar(
                         r=vals + [vals[0]],
                         theta=radar_cats + [radar_cats[0]],
                         fill="toself",
                         name=tier,
-                        line_color=QUALITY_COLORS[tier],
-                        fillcolor=QUALITY_COLORS[tier],
+                        line_color=_tier_color,
+                        fillcolor=_tier_color,
                         opacity=0.25,
                     ))
                 fig_radar.update_layout(
