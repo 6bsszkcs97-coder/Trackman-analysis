@@ -16,6 +16,25 @@ A personal analytics dashboard for [Trackman](https://www.trackman.com/) golf da
 
 ---
 
+## Screenshots
+
+**Shot quality breakdown per session**
+![Shot Quality Distribution](docs/screenshots/trends-quality.png)
+
+**Metrics over time by club**
+![Metrics Over Time](docs/screenshots/trends-metrics.png)
+
+**Shot dispersion — top-down view with ±1σ ellipses**
+![Shot Dispersion](docs/screenshots/shot-dispersion.png)
+
+**Clubface impact location — centroids per club**
+![Clubface Impact Location](docs/screenshots/impact-location.png)
+
+**Swing metric distribution by quality tier**
+![Distribution by Tier](docs/screenshots/quality-distribution.png)
+
+---
+
 ## Metrics tracked
 
 | Category | Metrics |
