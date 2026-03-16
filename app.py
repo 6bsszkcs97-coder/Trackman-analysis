@@ -173,7 +173,7 @@ def _accuracy_score_vec(offline: np.ndarray, tour_disp: float) -> np.ndarray:
 def score_shot_quality(df: pd.DataFrame) -> pd.DataFrame:
     """Score each shot 0–100 using fixed PGA Tour benchmarks.
 
-    SQS = 0.55 × CarryScore + 0.45 × AccuracyScore
+    SQS = 0.60 × CarryScore + 0.40 × AccuracyScore
     Adds columns: _sqs, _carry_score, _acc_score, _quality
     """
     df = df.copy()
@@ -194,13 +194,19 @@ def score_shot_quality(df: pd.DataFrame) -> pd.DataFrame:
 
         cs  = _carry_score_vec(carry, tour_c)
         acc = _accuracy_score_vec(off, tour_d)
-        sqs = np.clip(0.55 * cs + 0.45 * acc, 0.0, 100.0)
+        sqs = np.clip(0.60 * cs + 0.40 * acc, 0.0, 100.0)
+        # Cap 1: carry ≤ 50% of tour → Mishit ceiling (24)
+        # A ball that barely moves is always a Mishit regardless of accuracy
+        sqs = np.where(cs == 0.0, np.minimum(sqs, 24.0), sqs)
+        # Cap 2: offline > 4× tour dispersion → Scramble ceiling (44)
+        # A severely offline shot is never Playable regardless of carry
+        sqs = np.where(acc == 0.0, np.minimum(sqs, 44.0), sqs)
 
         q = pd.Series("Playable", index=idx)
-        q[sqs >= 80]                   = "Tour Quality"
-        q[(sqs >= 65) & (sqs < 80)]   = "Solid"
-        q[(sqs >= 45) & (sqs < 65)]   = "Playable"
-        q[(sqs >= 25) & (sqs < 45)]   = "Scramble"
+        q[sqs >= 87]                   = "Tour Quality"
+        q[(sqs >= 70) & (sqs < 87)]   = "Solid"
+        q[(sqs >= 50) & (sqs < 70)]   = "Playable"
+        q[(sqs >= 25) & (sqs < 50)]   = "Scramble"
         q[sqs < 25]                    = "Mishit"
 
         df.loc[idx, "_carry_score"] = cs
@@ -263,9 +269,8 @@ quality_filter = st.sidebar.multiselect(
     QUALITY_TIERS,
     default=QUALITY_TIERS,
     help=(
-        "SQS (0–100): Carry 60% · Accuracy 40%. "
-        "Carry expectation adjusted for your actual club speed that swing. "
-        "Tour Quality ≥80 · Solid ≥65 · Playable ≥45 · Scramble ≥25 · Mishit <25"
+        "SQS = 60% Carry + 40% Accuracy vs PGA Tour benchmarks. "
+        "Tour Quality ≥87 · Solid ≥70 · Playable ≥50 · Scramble ≥25 · Mishit <25"
     ),
 )
 
@@ -330,8 +335,11 @@ if not all_shots.empty:
 
 n_manual = int((all_shots["excluded"] == 1).sum()) if not all_shots.empty else 0
 
+n_days = sessions_df["date"].dt.normalize().nunique() if not sessions_df.empty else 0
+n_sess = len(sessions_df)
+session_label = f"{n_days} day{'s' if n_days != 1 else ''}" + (f" ({n_sess} sessions)" if n_sess > n_days else "")
 st.sidebar.caption(
-    f"{len(sessions_df)} sessions · {len(all_shots):,} shots"
+    f"{session_label} · {len(all_shots):,} shots"
     + (f" · {n_manual} manually excluded" if n_manual else "")
 )
 
@@ -368,12 +376,26 @@ with tab_overview:
         st.markdown("---")
 
     display_df = sessions_df.copy()
-    display_df["date"] = display_df["date"].dt.strftime("%Y-%m-%d")
-    display_df = display_df.rename(columns={
-        "date": "Date", "title": "Session", "location": "Location", "shot_count": "Shots",
-    })
-    st.dataframe(display_df[["Date", "Session", "Location", "Shots"]],
-                 use_container_width=True, hide_index=True)
+    display_df["_date_str"] = display_df["date"].dt.strftime("%Y-%m-%d")
+    # Combine multiple sessions on the same day into one row
+    overview = (
+        display_df.groupby("_date_str", sort=False)
+        .agg(
+            _n        = ("id",         "count"),
+            Location  = ("location",   "first"),
+            Shots     = ("shot_count", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"_date_str": "Date"})
+        .sort_values("Date", ascending=False)
+    )
+    overview["Sessions"] = overview["_n"].apply(
+        lambda n: f"{n} combined" if n > 1 else "1"
+    )
+    st.dataframe(
+        overview[["Date", "Sessions", "Location", "Shots"]],
+        use_container_width=True, hide_index=True,
+    )
 
 
 # ============================================================
@@ -385,10 +407,14 @@ with tab_trends:
     if chart_shots.empty:
         st.info("No shot data available for the selected filters.")
     else:
+        # Normalize date to date-only so same-day sessions merge into one point
+        ts = chart_shots.copy()
+        ts["date"] = ts["date"].dt.normalize()
+
         col_left, col_right = st.columns([1, 3])
         with col_left:
             metric = st.selectbox("Metric",
-                [m for m in KEY_METRICS if m in chart_shots.columns],
+                [m for m in KEY_METRICS if m in ts.columns],
                 format_func=metric_col)
             group_by_club = st.checkbox("Break out by club", value=True)
             show_rolling  = st.checkbox("Show 3-session rolling avg", value=False)
@@ -396,7 +422,7 @@ with tab_trends:
         with col_right:
             if group_by_club:
                 trend_df = (
-                    chart_shots.dropna(subset=[metric])
+                    ts.dropna(subset=[metric])
                     .groupby(["date", "club"])[metric].mean()
                     .reset_index().sort_values("date")
                 )
@@ -405,7 +431,7 @@ with tab_trends:
                               title=f"{metric_col(metric)} Over Time by Club")
             else:
                 trend_df = (
-                    chart_shots.dropna(subset=[metric])
+                    ts.dropna(subset=[metric])
                     .groupby("date")[metric].mean()
                     .reset_index().sort_values("date")
                 )
@@ -428,7 +454,7 @@ with tab_trends:
             st.plotly_chart(fig, use_container_width=True)
 
         st.subheader(f"Distribution — {metric_col(metric)}")
-        hist_df = chart_shots.dropna(subset=[metric])
+        hist_df = ts.dropna(subset=[metric])
         if not hist_df.empty:
             fig2 = px.histogram(hist_df, x=metric,
                                 color="club" if group_by_club else None,
@@ -438,24 +464,60 @@ with tab_trends:
             st.plotly_chart(fig2, use_container_width=True)
 
         # ── Shot quality over time ────────────────────────────────────────────
-        if "_quality" in chart_shots.columns and chart_shots["_quality"].notna().any():
+        if "_quality" in ts.columns and ts["_quality"].notna().any():
             st.markdown("---")
             st.subheader("Shot Quality Over Time")
             st.caption(
-                "**SQS (0–100):** 55% Carry + 45% Accuracy vs PGA Tour benchmarks. "
-                "A score of 70 means the shot was 70% as good as a Tour shot with that club. "
-                "**Tour Quality** ≥80 · **Solid** ≥65 · **Playable** ≥45 · **Scramble** ≥25 · **Mishit** <25"
+                "**SQS (0–100):** 60% Carry + 40% Accuracy vs PGA Tour benchmarks. "
+                "A score of 87 means the shot was Tour Quality. "
+                "**Tour Quality** ≥87 · **Solid** ≥70 · **Playable** ≥50 · **Scramble** ≥25 · **Mishit** <25"
             )
 
-            qual_shots = chart_shots[chart_shots["_quality"].notna()]
-            qual_trend = (
-                qual_shots
-                .groupby(["date", "_quality"])
-                .size()
-                .reset_index(name="count")
+            qual_shots = ts[ts["_quality"].notna()]
+
+            # ── Normalize toggle — shared by both quality charts ───────────────
+            normalize_mix = st.checkbox(
+                "Normalize by club mix",
+                value=False,
+                key="sqs_normalize",
+                help=(
+                    "Gives each club equal weight per session regardless of shot count. "
+                    "Removes bias from hitting mostly your best (or worst) clubs in a session — "
+                    "so a session of all wedges doesn't look artificially better than one of all drivers."
+                ),
             )
-            totals = qual_trend.groupby("date")["count"].transform("sum")
-            qual_trend["pct"] = (qual_trend["count"] / totals * 100).round(1)
+
+            # ── Shot quality distribution (stacked bar) ───────────────────────
+            if normalize_mix and "club" in qual_shots.columns:
+                # Per-club: compute tier % per session, then average across clubs (equal club weight)
+                club_tier = (
+                    qual_shots
+                    .groupby(["date", "club", "_quality"])
+                    .size()
+                    .reset_index(name="count")
+                )
+                club_totals = club_tier.groupby(["date", "club"])["count"].transform("sum")
+                club_tier["club_pct"] = club_tier["count"] / club_totals * 100
+                qual_trend = (
+                    club_tier
+                    .groupby(["date", "_quality"])["club_pct"]
+                    .mean()
+                    .reset_index()
+                    .rename(columns={"club_pct": "pct"})
+                )
+                qual_trend["pct"] = qual_trend["pct"].round(1)
+                bar_title = "Shot Quality Distribution Per Session (club-normalized)"
+            else:
+                qual_trend = (
+                    qual_shots
+                    .groupby(["date", "_quality"])
+                    .size()
+                    .reset_index(name="count")
+                )
+                totals = qual_trend.groupby("date")["count"].transform("sum")
+                qual_trend["pct"] = (qual_trend["count"] / totals * 100).round(1)
+                bar_title = "Shot Quality Distribution Per Session"
+
             qual_trend["_quality"] = pd.Categorical(
                 qual_trend["_quality"], categories=QUALITY_TIERS, ordered=True
             )
@@ -470,7 +532,7 @@ with tab_trends:
                 category_orders={"_quality": QUALITY_TIERS, "session": session_order},
                 text="pct",
                 labels={"session": "Session", "pct": "% of shots", "_quality": "Tier"},
-                title="Shot Quality Distribution Per Session",
+                title=bar_title,
             )
             fig_q.update_traces(texttemplate="%{text:.0f}%", textposition="inside",
                                 textfont_size=10)
@@ -481,26 +543,45 @@ with tab_trends:
             st.plotly_chart(fig_q, use_container_width=True)
 
             # ── Avg SQS trend ─────────────────────────────────────────────
-            if "_sqs" in chart_shots.columns and chart_shots["_sqs"].notna().any():
+            if "_sqs" in ts.columns and ts["_sqs"].notna().any():
                 sqs_group = st.radio(
                     "SQS trend grouping", ["Overall", "By club"],
                     horizontal=True, key="sqs_group_mode",
                 )
                 if sqs_group == "Overall":
-                    sqs_trend = (
-                        chart_shots.dropna(subset=["_sqs"])
-                        .groupby("date")["_sqs"].mean().reset_index()
-                        .sort_values("date")
-                    )
+                    sqs_raw = ts.dropna(subset=["_sqs"])
+                    if normalize_mix:
+                        # Step 1: avg SQS per club per session → Step 2: avg of those (equal club weight)
+                        sqs_trend = (
+                            sqs_raw
+                            .groupby(["date", "club"])["_sqs"].mean()
+                            .groupby("date").mean()
+                            .reset_index()
+                            .sort_values("date")
+                        )
+                        sqs_title = "Average SQS Per Session (club-normalized)"
+                    else:
+                        sqs_trend = (
+                            sqs_raw.groupby("date")["_sqs"].mean()
+                            .reset_index().sort_values("date")
+                        )
+                        sqs_title = "Average SQS Per Session"
                     sqs_trend["session"] = sqs_trend["date"].dt.strftime("%m/%d/%y")
-                    fig_sqs = px.line(
-                        sqs_trend, x="session", y="_sqs", markers=True,
-                        labels={"session": "Session", "_sqs": "Avg SQS"},
-                        title="Average SQS Per Session",
-                    )
+                    fig_sqs = go.Figure()
+                    # Shaded area fill under the line
+                    fig_sqs.add_trace(go.Scatter(
+                        x=sqs_trend["session"], y=sqs_trend["_sqs"],
+                        mode="lines+markers",
+                        line=dict(color="#2d6a4f", width=2.5),
+                        marker=dict(size=8, color="#2d6a4f"),
+                        fill="tozeroy",
+                        fillcolor="rgba(82,183,136,0.15)",
+                        name="Avg SQS",
+                    ))
+                    fig_sqs.update_layout(title=sqs_title)
                 else:
                     sqs_trend = (
-                        chart_shots.dropna(subset=["_sqs"])
+                        ts.dropna(subset=["_sqs"])
                         .groupby(["date", "club"])["_sqs"].mean().reset_index()
                         .sort_values("date")
                     )
@@ -510,16 +591,32 @@ with tab_trends:
                         labels={"session": "Session", "_sqs": "Avg SQS", "club": "Club"},
                         title="Average SQS Per Session by Club",
                     )
-                fig_sqs.add_hline(y=80, line_dash="dot", line_color="#2d6a4f",
+                # Coloured tier bands (bottom to top)
+                tier_bands = [
+                    (0,  25, "rgba(107,5,4,0.08)"),     # Mishit
+                    (25, 50, "rgba(230,57,70,0.08)"),    # Scramble
+                    (50, 70, "rgba(244,162,97,0.10)"),   # Playable
+                    (70, 87, "rgba(82,183,136,0.10)"),   # Solid
+                    (87, 100, "rgba(45,106,79,0.12)"),   # Tour Quality
+                ]
+                for y0, y1, col in tier_bands:
+                    fig_sqs.add_hrect(
+                        y0=y0, y1=y1, fillcolor=col, line_width=0,
+                    )
+                fig_sqs.add_hline(y=87, line_dash="dot", line_color="#2d6a4f",
                                   annotation_text="Tour Quality", annotation_position="right",
                                   opacity=0.6)
-                fig_sqs.add_hline(y=65, line_dash="dot", line_color="#52b788",
+                fig_sqs.add_hline(y=70, line_dash="dot", line_color="#52b788",
                                   annotation_text="Solid", annotation_position="right",
                                   opacity=0.6)
+                fig_sqs.add_hline(y=50, line_dash="dot", line_color="#f4a261",
+                                  annotation_text="Playable", annotation_position="right",
+                                  opacity=0.5)
                 fig_sqs.update_layout(
-                    height=360, plot_bgcolor="white",
-                    yaxis=dict(range=[0, 100]),
+                    height=480, plot_bgcolor="white",
+                    yaxis=dict(range=[0, 100], title="Avg SQS"),
                     xaxis_title="Session",
+                    showlegend=(sqs_group != "Overall"),
                 )
                 st.plotly_chart(fig_sqs, use_container_width=True)
 
@@ -537,10 +634,27 @@ with tab_session:
             f"{row['date'].strftime('%Y-%m-%d')} – {row['title']}": row["id"]
             for _, row in sessions_df.iterrows()
         }
-        selected_label = st.selectbox("Select session", list(session_options.keys()))
-        selected_id    = session_options[selected_label]
+        session_labels = list(session_options.keys())
 
-        session_shots_raw = load_shots(session_id=selected_id)
+        select_all = st.checkbox("All sessions", value=False, key="detail_all_sessions")
+        if select_all:
+            selected_labels = session_labels
+        else:
+            selected_labels = st.multiselect(
+                "Select session(s)", session_labels,
+                default=[session_labels[0]],
+                key="detail_session_multi",
+            )
+            if not selected_labels:
+                selected_labels = [session_labels[0]]
+
+        selected_ids = [session_options[l] for l in selected_labels]
+        multi_session = len(selected_ids) > 1
+
+        frames = [load_shots(session_id=sid) for sid in selected_ids]
+        session_shots_raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not session_shots_raw.empty:
+            session_shots_raw["date"] = pd.to_datetime(session_shots_raw["date"], errors="coerce")
         if club_filter:
             session_shots_raw = session_shots_raw[session_shots_raw["club"].isin(club_filter)]
         session_shots = apply_exclusions(session_shots_raw)
@@ -556,7 +670,7 @@ with tab_session:
             sess_clean = session_shots[~session_shots["_excluded"]]
 
             # ── Averages ────────────────────────────────────────────────────
-            st.markdown("#### Session Averages")
+            st.markdown("#### Averages")
             avail = [m for m in KEY_METRICS
                      if m in sess_clean.columns and sess_clean[m].notna().any()]
 
@@ -583,23 +697,44 @@ with tab_session:
             # ── Scatter ──────────────────────────────────────────────────────
             avail_all = [m for m in METRIC_LABELS
                          if m in session_shots.columns and session_shots[m].notna().any()]
+            # Prepend SQS if available
+            sqs_label = "_sqs"
+            if sqs_label in sess_clean.columns and sess_clean[sqs_label].notna().any():
+                avail_all = [sqs_label] + avail_all
+
+            def scatter_metric_label(col):
+                if col == "_sqs": return "SQS"
+                return metric_col(col)
+
             col_l, col_r = st.columns(2)
             with col_l:
                 x_metric = st.selectbox("X axis", avail_all,
                     index=avail_all.index("club_speed") if "club_speed" in avail_all else 0,
-                    format_func=metric_col, key="x_metric")
+                    format_func=scatter_metric_label, key="x_metric")
             with col_r:
                 y_metric = st.selectbox("Y axis", avail_all,
                     index=avail_all.index("carry") if "carry" in avail_all else 1,
-                    format_func=metric_col, key="y_metric")
+                    format_func=scatter_metric_label, key="y_metric")
 
             scatter_df = sess_clean.dropna(subset=[x_metric, y_metric])
             if not scatter_df.empty:
-                fig = px.scatter(scatter_df, x=x_metric, y=y_metric, color="club",
-                    hover_data=["shot_number", "club"],
-                    labels={x_metric: metric_col(x_metric), y_metric: metric_col(y_metric)},
-                    title=f"{metric_col(x_metric)} vs {metric_col(y_metric)}")
-                fig.update_layout(height=380, plot_bgcolor="white")
+                if multi_session:
+                    scatter_df = scatter_df.copy()
+                    scatter_df["_session"] = scatter_df["date"].dt.strftime("%m/%d/%y")
+                    fig = px.scatter(scatter_df, x=x_metric, y=y_metric,
+                        color="_session", symbol="club",
+                        hover_data=["shot_number", "club", "_session"],
+                        labels={x_metric: scatter_metric_label(x_metric),
+                                y_metric: scatter_metric_label(y_metric),
+                                "_session": "Session"},
+                        title=f"{scatter_metric_label(x_metric)} vs {scatter_metric_label(y_metric)}")
+                else:
+                    fig = px.scatter(scatter_df, x=x_metric, y=y_metric, color="club",
+                        hover_data=["shot_number", "club"],
+                        labels={x_metric: scatter_metric_label(x_metric),
+                                y_metric: scatter_metric_label(y_metric)},
+                        title=f"{scatter_metric_label(x_metric)} vs {scatter_metric_label(y_metric)}")
+                fig.update_layout(height=520, plot_bgcolor="white")
                 st.plotly_chart(fig, use_container_width=True)
 
             st.markdown("---")
@@ -614,8 +749,12 @@ with tab_session:
             edit_df  = session_shots.reset_index(drop=True)
             shot_ids = edit_df["id"].tolist()
 
-            editor_input = edit_df[["shot_number", "club"] + display_metrics].copy()
-            editor_input.insert(2, "Exclude", edit_df["_excluded"].astype(bool))
+            base_cols = ["shot_number", "club"]
+            if multi_session:
+                edit_df["_sess_label"] = edit_df["date"].dt.strftime("%m/%d/%y")
+                base_cols = ["_sess_label"] + base_cols
+            editor_input = edit_df[base_cols + display_metrics].copy()
+            editor_input.insert(len(base_cols), "Exclude", edit_df["_excluded"].astype(bool))
 
             # Add SQS and Tier columns if available
             extra_disabled = []
@@ -624,22 +763,24 @@ with tab_session:
                 editor_input.insert(4, "Tier", edit_df["_quality"].fillna("–"))
                 extra_disabled = ["SQS", "Tier"]
 
-            rename_map = {"shot_number": "#", "club": "Club"}
+            rename_map = {"shot_number": "#", "club": "Club", "_sess_label": "Session"}
             rename_map.update({m: metric_col(m) for m in display_metrics})
             editor_display = editor_input.rename(columns=rename_map)
 
+            always_disabled = (["Session"] if multi_session else []) + ["#", "Club"]
             edited = st.data_editor(
                 editor_display,
                 column_config={
                     "Exclude": st.column_config.CheckboxColumn("Exclude", width="small"),
+                    "Session": st.column_config.TextColumn("Session", width="small"),
                     "#":       st.column_config.NumberColumn("#", width="small"),
                     "SQS":     st.column_config.NumberColumn("SQS", width="small", format="%.1f"),
                     "Tier":    st.column_config.TextColumn("Tier", width="small"),
                 },
-                disabled=["#", "Club"] + extra_disabled + [metric_col(m) for m in display_metrics],
+                disabled=always_disabled + extra_disabled + [metric_col(m) for m in display_metrics],
                 hide_index=True,
                 use_container_width=True,
-                key=f"shot_editor_{selected_id}",
+                key=f"shot_editor_{'_'.join(sorted(selected_ids))}",
             )
 
             if st.button("💾 Save exclusions", key="save_btn"):
@@ -651,7 +792,7 @@ with tab_session:
                 if changed:
                     for i, new_val in changed:
                         db.update_shot_excluded(shot_ids[i], 1 if new_val else None)
-                    editor_key = f"shot_editor_{selected_id}"
+                    editor_key = f"shot_editor_{'_'.join(sorted(selected_ids))}"
                     if editor_key in st.session_state:
                         del st.session_state[editor_key]
                     st.cache_data.clear()
@@ -705,7 +846,16 @@ with tab_clubs:
             chart_shots.dropna(how="all", subset=avail_metrics)
             .groupby("club")[avail_metrics].mean().round(1).reset_index()
         )
-        full_agg.columns = ["Club"] + [metric_col(m) for m in avail_metrics]
+        if "_sqs" in chart_shots.columns and chart_shots["_sqs"].notna().any():
+            sqs_by_club = (
+                chart_shots.dropna(subset=["_sqs"])
+                .groupby("club")["_sqs"].mean().round(1)
+            )
+            full_agg["_sqs"] = full_agg["club"].map(sqs_by_club)
+            full_agg = full_agg[["club", "_sqs"] + avail_metrics]
+            full_agg.columns = ["Club", "Avg SQS"] + [metric_col(m) for m in avail_metrics]
+        else:
+            full_agg.columns = ["Club"] + [metric_col(m) for m in avail_metrics]
         st.dataframe(full_agg.set_index("Club"), use_container_width=True)
 
         radar_metrics = ["ball_speed", "club_speed", "smash_factor",
@@ -923,48 +1073,59 @@ with tab_dispersion:
                         )
                     else:
                         color_by = "club"
+                    show_individual = st.checkbox(
+                        "Show individual shots",
+                        value=True,
+                        key="impact_show_individual",
+                        help="Toggle off to show only the per-club average (centroid) marker.",
+                    )
 
                 with imp_col_r:
                     if impact_view == "Scatter":
-                        if color_by == "club":
-                            fig_imp = px.scatter(
-                                impact_df,
-                                x="impact_offset", y="impact_height",
-                                color="club",
-                                hover_data=["shot_number", "carry", "smash_factor"],
-                                labels={"impact_offset": "Horizontal (cm)", "impact_height": "Vertical (cm)"},
-                                title="Impact Location on Clubface",
-                            )
+                        if show_individual:
+                            if color_by == "club":
+                                fig_imp = px.scatter(
+                                    impact_df,
+                                    x="impact_offset", y="impact_height",
+                                    color="club",
+                                    hover_data=["shot_number", "carry", "smash_factor"],
+                                    labels={"impact_offset": "Horizontal (cm)", "impact_height": "Vertical (cm)"},
+                                    title="Impact Location on Clubface",
+                                )
+                            else:
+                                fig_imp = px.scatter(
+                                    impact_df,
+                                    x="impact_offset", y="impact_height",
+                                    color=color_by,
+                                    color_continuous_scale="RdYlGn",
+                                    hover_data=["club", "shot_number", "carry", "smash_factor"],
+                                    labels={
+                                        "impact_offset": "Horizontal (cm)",
+                                        "impact_height": "Vertical (cm)",
+                                        color_by: metric_col(color_by),
+                                    },
+                                    title="Impact Location on Clubface",
+                                )
                         else:
-                            fig_imp = px.scatter(
-                                impact_df,
-                                x="impact_offset", y="impact_height",
-                                color=color_by,
-                                color_continuous_scale="RdYlGn",
-                                hover_data=["club", "shot_number", "carry", "smash_factor"],
-                                labels={
-                                    "impact_offset": "Horizontal (cm)",
-                                    "impact_height": "Vertical (cm)",
-                                    color_by: metric_col(color_by),
-                                },
-                                title="Impact Location on Clubface",
-                            )
+                            fig_imp = go.Figure()
+                            fig_imp.update_layout(title="Impact Location on Clubface — Centroids Only")
                     else:  # Density contours, one per club
                         fig_imp = go.Figure()
-                        for i, club in enumerate(sorted(sel_clubs)):
-                            cd = impact_df[impact_df["club"] == club]
-                            if len(cd) < 4:
-                                continue
-                            c = club_color.get(club, palette[i % len(palette)])
-                            fig_imp.add_trace(go.Histogram2dContour(
-                                x=cd["impact_offset"], y=cd["impact_height"],
-                                name=club,
-                                colorscale=[[0, "rgba(255,255,255,0.01)"], [1, c]],
-                                showscale=False,
-                                ncontours=6,
-                                line_width=1.5,
-                            ))
-                        fig_imp.update_layout(title="Impact Density by Club")
+                        if show_individual:
+                            for i, club in enumerate(sorted(sel_clubs)):
+                                cd = impact_df[impact_df["club"] == club]
+                                if len(cd) < 4:
+                                    continue
+                                c = club_color.get(club, palette[i % len(palette)])
+                                fig_imp.add_trace(go.Histogram2dContour(
+                                    x=cd["impact_offset"], y=cd["impact_height"],
+                                    name=club,
+                                    colorscale=[[0, "rgba(255,255,255,0.01)"], [1, c]],
+                                    showscale=False,
+                                    ncontours=6,
+                                    line_width=1.5,
+                                ))
+                        fig_imp.update_layout(title="Impact Density by Club" if show_individual else "Impact Location — Centroids Only")
 
                     # Clubface outline + crosshairs (shared for both modes)
                     fig_imp.add_shape(
@@ -974,10 +1135,48 @@ with tab_dispersion:
                     )
                     fig_imp.add_hline(y=0, line_dash="dot", line_color="lightgray", line_width=0.8)
                     fig_imp.add_vline(x=0, line_dash="dot", line_color="lightgray", line_width=0.8)
+
+                    # ── Per-club centroid markers (shared for both modes) ──────────
+                    centroid_df = (
+                        impact_df.groupby("club")[["impact_offset", "impact_height"]]
+                        .mean().reset_index()
+                    )
+                    for _, crow in centroid_df.iterrows():
+                        c_club  = crow["club"]
+                        c_color = club_color.get(c_club, "#333333")
+                        fig_imp.add_trace(go.Scatter(
+                            x=[crow["impact_offset"]],
+                            y=[crow["impact_height"]],
+                            mode="markers+text",
+                            name=c_club,
+                            text=[c_club],
+                            textposition="top center",
+                            textfont=dict(size=10, color=c_color),
+                            marker=dict(
+                                symbol="circle",
+                                size=22,
+                                color=c_color,
+                                line=dict(width=3, color="white"),
+                                opacity=1.0,
+                            ),
+                            showlegend=True,
+                        ))
+
                     fig_imp.update_layout(
-                        height=430, plot_bgcolor="white",
-                        xaxis_title="← Heel  ·  Horizontal (cm)  ·  Toe →",
-                        yaxis_title="Vertical (cm)",
+                        height=810, plot_bgcolor="white",
+                        xaxis=dict(
+                            title="← Heel  ·  Horizontal (cm)  ·  Toe →",
+                            range=[-3.5, 3.5],
+                            constrain="domain",
+                            fixedrange=True,
+                        ),
+                        yaxis=dict(
+                            title="Vertical (cm)",
+                            range=[-3.0, 3.0],
+                            scaleanchor="x",
+                            scaleratio=1,
+                            fixedrange=True,
+                        ),
                     )
                     st.plotly_chart(fig_imp, use_container_width=True)
 

@@ -41,10 +41,10 @@ SQS = (0.55 × Carry Score) + (0.45 × Accuracy Score)
 
 | Tier | SQS |
 |---|---|
-| Tour Quality | 80–100 |
-| Solid | 65–79 |
-| Playable | 45–64 |
-| Scramble | 25–44 |
+| Tour Quality | 87–100 |
+| Solid | 70–86 |
+| Playable | 50–69 |
+| Scramble | 25–49 |
 | Mishit | 0–24 |
 
 Benchmarks are fixed PGA Tour numbers — not derived from your personal data — so scores are consistent and comparable across sessions and golfers.
