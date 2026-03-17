@@ -234,6 +234,15 @@ def metric_col(col):
     return METRIC_LABELS.get(col, col.replace("_", " ").title())
 
 
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """Convert a 6-digit hex colour string (e.g. '#636EFA') to an rgba() CSS string."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        raise ValueError(f"_hex_to_rgba expects a 6-digit hex string, got: {hex_color!r}")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -1032,10 +1041,10 @@ with tab_dispersion:
             max_shots = st.slider("Max shots per club", 10, 200, 50, 10, key="disp_max",
                                   help="Limit tracers for readability.")
             if view_mode == "Top-down":
-                dots_only    = st.checkbox("Dots only (no tracers)", value=False, key="disp_dots")
+                show_tracers = st.checkbox("Show tracers", value=True, key="disp_tracers")
                 show_circles = st.checkbox("Dispersion circles (±1σ)", value=False, key="disp_circles")
             else:
-                dots_only    = False
+                show_tracers = True
                 show_circles = False
 
         with col_r:
@@ -1062,7 +1071,10 @@ with tab_dispersion:
                             continue
                         has_any_traj = True
                         if view_mode == "Top-down":
-                            if not dots_only:
+                            # NOTE: has_any_traj is set above, before the show_tracers guard —
+                            # keep it there so the "No trajectory data" warning is suppressed
+                            # even when tracers are toggled off.
+                            if show_tracers:
                                 xs.extend([pt.get("Z", 0) for pt in traj] + [None])
                                 ys.extend([pt.get("X", 0) for pt in traj] + [None])
                             landing_pts[club].append(
@@ -1072,31 +1084,20 @@ with tab_dispersion:
                             xs.extend([pt.get("X", 0) for pt in traj] + [None])
                             ys.extend([pt.get("Y", 0) for pt in traj] + [None])
 
-                    if xs:
-                        fig_disp.add_trace(go.Scatter(
-                            x=xs, y=ys,
-                            mode="lines",
-                            name=club,
-                            line=dict(color=club_color[club], width=1.2),
-                            opacity=0.55,
-                        ))
-
-                # Dots-only mode: plot landing points as markers
-                if view_mode == "Top-down" and dots_only:
-                    for club in sel_clubs:
-                        pts = landing_pts[club]
-                        if not pts:
-                            continue
-                        fig_disp.add_trace(go.Scatter(
-                            x=[p[0] for p in pts],
-                            y=[p[1] for p in pts],
-                            mode="markers",
-                            name=club,
-                            marker=dict(color=club_color[club], size=7),
-                            opacity=0.75,
-                        ))
+                    if show_tracers:
+                        if xs:
+                            fig_disp.add_trace(go.Scatter(
+                                x=xs, y=ys,
+                                mode="lines",
+                                name=club,
+                                showlegend=False,
+                                line=dict(color=club_color[club], width=1.2),
+                                opacity=0.15,
+                            ))
 
                 # Dispersion circles: ±1σ ellipse around each club's landing centroid
+                # Must run BEFORE the dots block so clubs_with_ellipse is populated first.
+                clubs_with_ellipse: set[str] = set()
                 if view_mode == "Top-down" and show_circles:
                     theta = np.linspace(0, 2 * np.pi, 120)
                     for club in sel_clubs:
@@ -1110,13 +1111,17 @@ with tab_dispersion:
                         r_carry = carries.std()
                         if r_lat == 0 or r_carry == 0:
                             continue
+                        clubs_with_ellipse.add(club)
                         fig_disp.add_trace(go.Scatter(
                             x=c_lat   + r_lat   * np.cos(theta),
                             y=c_carry + r_carry * np.sin(theta),
                             mode="lines",
                             name=f"{club} ±1σ",
-                            line=dict(color=club_color[club], width=2, dash="dash"),
-                            opacity=0.9,
+                            fill="toself",
+                            fillcolor=_hex_to_rgba(club_color[club], 0.12),
+                            line=dict(color=club_color[club], width=2.5),
+                            opacity=1.0,
+                            showlegend=True,
                         ))
                         fig_disp.add_trace(go.Scatter(
                             x=[c_lat], y=[c_carry],
@@ -1127,15 +1132,42 @@ with tab_dispersion:
                             showlegend=False,
                         ))
 
+                # Landing dots — rendered for all clubs except those with a valid ellipse
+                if view_mode == "Top-down":
+                    for club in sel_clubs:
+                        if show_circles and club in clubs_with_ellipse:
+                            continue  # ellipse is the spatial summary for this club
+                        pts = landing_pts[club]
+                        if not pts:
+                            continue
+                        fig_disp.add_trace(go.Scatter(
+                            x=[p[0] for p in pts],
+                            y=[p[1] for p in pts],
+                            mode="markers",
+                            name=club,
+                            showlegend=True,
+                            marker=dict(
+                                color=club_color[club],
+                                size=10,
+                                line=dict(color="white", width=1.5),
+                            ),
+                            opacity=0.95,
+                        ))
+
                 if not has_any_traj:
                     st.warning("No trajectory data found. Make sure shots were synced with raw_json.")
                 else:
                     if view_mode == "Top-down":
-                        # Fix axes to max values across ALL shots (ignore quality filter)
-                        max_off = all_shots["offline"].abs().max() if not all_shots.empty else 50
+                        # Fix x-axis to the selected clubs' shots (not all shots) so one
+                        # stray driver doesn't blow out the iron dispersion view.
+                        _disp_off = (
+                            chart_shots[chart_shots["club"].isin(sel_clubs)]["offline"].abs()
+                            if sel_clubs else chart_shots["offline"].abs()
+                        )
+                        max_off = _disp_off.max() if not _disp_off.empty else 30
                         if pd.isna(max_off) or max_off == 0:
-                            max_off = 50
-                        x_pad = max(max_off * 1.05, 5)  # 5% padding, minimum ±5 yds
+                            max_off = 30
+                        x_pad = max(max_off * 1.15, 10)  # 15% breathing room, minimum ±10 yds
 
                         max_carry = all_shots["carry"].max() if not all_shots.empty else 300
                         if pd.isna(max_carry) or max_carry == 0:
@@ -1148,7 +1180,7 @@ with tab_dispersion:
                             xaxis_title="← Left  ·  Offline (yds)  ·  Right →",
                             yaxis_title="Carry Distance (yds)",
                             xaxis=dict(range=[-x_pad, x_pad]),
-                            yaxis=dict(range=[0, y_pad]),
+                            yaxis=dict(rangemode="tozero"),
                             height=560,
                             plot_bgcolor="white",
                         )
@@ -1183,77 +1215,78 @@ with tab_dispersion:
 
                 with imp_col_l:
                     impact_view = st.radio(
-                        "Display mode", ["Scatter", "Density"], key="impact_view",
-                        help="Scatter = individual shots · Density = concentration contours per club",
-                    )
-                    if impact_view == "Scatter":
-                        color_by = st.selectbox(
-                            "Color by",
-                            ["smash_factor", "carry", "club"],
-                            format_func=lambda x: {
-                                "smash_factor": "Smash Factor",
-                                "carry":        "Carry (yds)",
-                                "club":         "Club",
-                            }[x],
-                            key="impact_color",
-                        )
-                    else:
-                        color_by = "club"
-                    show_individual = st.checkbox(
-                        "Show individual shots",
-                        value=True,
-                        key="impact_show_individual",
-                        help="Toggle off to show only the per-club average (centroid) marker.",
+                        "Display mode", ["Aggregate", "Scatter"],
+                        key="impact_view",
+                        help="Aggregate = one centroid per club · Scatter = all individual shots",
                     )
 
                 with imp_col_r:
-                    if impact_view == "Scatter":
-                        if show_individual:
-                            if color_by == "club":
-                                fig_imp = px.scatter(
-                                    impact_df,
-                                    x="impact_offset", y="impact_height",
-                                    color="club",
-                                    hover_data=["shot_number", "carry", "smash_factor"],
-                                    labels={"impact_offset": "Horizontal (cm)", "impact_height": "Vertical (cm)"},
-                                    title="Impact Location on Clubface",
-                                )
-                            else:
-                                fig_imp = px.scatter(
-                                    impact_df,
-                                    x="impact_offset", y="impact_height",
-                                    color=color_by,
-                                    color_continuous_scale="RdYlGn",
-                                    hover_data=["club", "shot_number", "carry", "smash_factor"],
-                                    labels={
-                                        "impact_offset": "Horizontal (cm)",
-                                        "impact_height": "Vertical (cm)",
-                                        color_by: metric_col(color_by),
-                                    },
-                                    title="Impact Location on Clubface",
-                                )
-                        else:
-                            fig_imp = go.Figure()
-                            fig_imp.update_layout(title="Impact Location on Clubface — Centroids Only")
-                    else:  # Density contours, one per club
-                        fig_imp = go.Figure()
-                        if show_individual:
-                            for i, club in enumerate(sorted(sel_clubs)):
-                                cd = impact_df[impact_df["club"] == club]
-                                if len(cd) < 4:
-                                    continue
-                                c = club_color.get(club, palette[i % len(palette)])
-                                fig_imp.add_trace(go.Histogram2dContour(
-                                    x=cd["impact_offset"], y=cd["impact_height"],
-                                    name=club,
-                                    colorscale=[[0, "rgba(255,255,255,0.01)"], [1, c]],
-                                    showscale=False,
-                                    ncontours=6,
-                                    line_width=1.5,
-                                ))
-                        fig_imp.update_layout(title="Impact Density by Club" if show_individual else "Impact Location — Centroids Only")
+                    fig_imp = go.Figure()
 
-                    # Clubface outline + crosshairs (shared for both modes)
+                    if impact_view == "Aggregate":
+                        centroid_df = (
+                            impact_df.groupby("club")[["impact_offset", "impact_height"]]
+                            .agg(
+                                impact_offset=("impact_offset", "mean"),
+                                impact_height=("impact_height", "mean"),
+                                n=("impact_offset", "count"),
+                            )
+                            .reset_index()
+                        )
+                        for _, row in centroid_df.iterrows():
+                            c = club_color.get(row["club"], "#333333")
+                            fig_imp.add_trace(go.Scatter(
+                                x=[row["impact_offset"]],
+                                y=[row["impact_height"]],
+                                mode="markers+text",
+                                name=row["club"],
+                                text=[row["club"]],
+                                textposition="top center",
+                                textfont=dict(size=10, color=c),
+                                customdata=[[int(row["n"])]],
+                                hovertemplate=(
+                                    "<b>%{text}</b><br>"
+                                    "Horizontal: %{x:.2f} cm<br>"
+                                    "Vertical: %{y:.2f} cm<br>"
+                                    "n=%{customdata[0]}<extra></extra>"
+                                ),
+                                marker=dict(
+                                    size=14,
+                                    color=c,
+                                    line=dict(width=2.5, color="white"),
+                                ),
+                                showlegend=True,
+                            ))
+                        fig_imp.update_layout(title="Impact Location — Club Averages")
+
+                    else:  # Scatter
+                        for i, club in enumerate(sorted(sel_clubs)):
+                            cd = impact_df[impact_df["club"] == club]
+                            if cd.empty:
+                                continue
+                            c = club_color.get(club, palette[i % len(palette)])
+                            fig_imp.add_trace(go.Scatter(
+                                x=cd["impact_offset"],
+                                y=cd["impact_height"],
+                                mode="markers",
+                                name=club,
+                                customdata=cd[["shot_number", "carry", "smash_factor"]].values,
+                                hovertemplate=(
+                                    "<b>Shot %{customdata[0]}</b><br>"
+                                    "Carry: %{customdata[1]:.0f} yds<br>"
+                                    "Smash: %{customdata[2]:.2f}<extra></extra>"
+                                ),
+                                marker=dict(
+                                    size=8,
+                                    color=c,
+                                    opacity=0.6,
+                                    line=dict(width=1.5, color="white"),
+                                ),
+                                showlegend=True,
+                            ))
+                        fig_imp.update_layout(title="Impact Location — All Shots")
+
+                    # Clubface outline + crosshairs (shared)
                     fig_imp.add_shape(
                         type="rect", x0=-2.5, y0=-2.0, x1=2.5, y1=2.0,
                         line=dict(color="gray", dash="dot", width=1),
@@ -1261,32 +1294,6 @@ with tab_dispersion:
                     )
                     fig_imp.add_hline(y=0, line_dash="dot", line_color="lightgray", line_width=0.8)
                     fig_imp.add_vline(x=0, line_dash="dot", line_color="lightgray", line_width=0.8)
-
-                    # ── Per-club centroid markers (shared for both modes) ──────────
-                    centroid_df = (
-                        impact_df.groupby("club")[["impact_offset", "impact_height"]]
-                        .mean().reset_index()
-                    )
-                    for _, crow in centroid_df.iterrows():
-                        c_club  = crow["club"]
-                        c_color = club_color.get(c_club, "#333333")
-                        fig_imp.add_trace(go.Scatter(
-                            x=[crow["impact_offset"]],
-                            y=[crow["impact_height"]],
-                            mode="markers+text",
-                            name=c_club,
-                            text=[c_club],
-                            textposition="top center",
-                            textfont=dict(size=10, color=c_color),
-                            marker=dict(
-                                symbol="circle",
-                                size=22,
-                                color=c_color,
-                                line=dict(width=3, color="white"),
-                                opacity=1.0,
-                            ),
-                            showlegend=True,
-                        ))
 
                     fig_imp.update_layout(
                         height=810, plot_bgcolor="white",
