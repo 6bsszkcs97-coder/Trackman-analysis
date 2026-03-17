@@ -55,7 +55,7 @@ def load_shots(session_id=None, club=None):
 
 @st.cache_data(ttl=30)
 def load_clubs():
-    return db.get_clubs()
+    return sort_clubs(db.get_clubs())
 
 @st.cache_data(ttl=30)
 def load_trajectories():
@@ -89,6 +89,33 @@ QUALITY_COLORS = {
     "Scramble":     "#e63946",
     "Mishit":       "#6b0504",
 }
+
+# Canonical club order — longest to shortest (includes clubs not yet in DB for future-proofing)
+CLUB_ORDER = [
+    "Driver",
+    "2Wood", "3Wood", "4Wood", "5Wood", "7Wood",
+    "DrivingIron", "2Iron",
+    "3Hybrid", "3Iron",
+    "4Hybrid", "4Iron",
+    "5Hybrid", "5Iron",
+    "6Hybrid", "6Iron",
+    "7Hybrid", "7Iron",
+    "8Iron", "9Iron",
+    "PitchingWedge",
+    "GapWedge", "50Wedge", "52Wedge",
+    "SandWedge", "54Wedge", "56Wedge",
+    "LobWedge", "58Wedge", "60Wedge", "64Wedge",
+]
+_CLUB_RANK = {c: i for i, c in enumerate(CLUB_ORDER)}
+
+
+def sort_clubs(clubs) -> list:
+    """Sort a collection of club name strings by canonical longest-to-shortest order.
+    Unrecognised clubs are appended alphabetically at the end."""
+    known   = [c for c in clubs if c in _CLUB_RANK]
+    unknown = sorted(c for c in clubs if c not in _CLUB_RANK)
+    return sorted(known, key=lambda c: _CLUB_RANK[c]) + unknown
+
 
 # PGA Tour carry benchmarks (yards) — fixed reference, not golfer-specific
 TOUR_CARRY = {
@@ -984,11 +1011,13 @@ with tab_clubs:
                 .agg(["mean", "std", "count"])
                 .reset_index()
                 .rename(columns={"mean": "Average", "std": "Std Dev", "count": "Shots"})
-                .sort_values("Average", ascending=False)
             )
             if not show_all_clubs:
                 top = club_agg.nlargest(8, "Shots")["club"].tolist()
                 club_agg = club_agg[club_agg["club"].isin(top)]
+            # Order bars by canonical club order (longest → shortest)
+            club_agg["_order"] = club_agg["club"].map(lambda c: _CLUB_RANK.get(c, 999))
+            club_agg = club_agg.sort_values("_order").drop(columns="_order")
 
             fig = px.bar(club_agg, x="club", y="Average", error_y="Std Dev",
                          text="Average",
@@ -1004,6 +1033,9 @@ with tab_clubs:
             chart_shots.dropna(how="all", subset=avail_metrics)
             .groupby("club")[avail_metrics].mean().round(1).reset_index()
         )
+        # Order rows by canonical club order
+        full_agg["_order"] = full_agg["club"].map(lambda c: _CLUB_RANK.get(c, 999))
+        full_agg = full_agg.sort_values("_order").drop(columns="_order")
         if "_sqs" in chart_shots.columns and chart_shots["_sqs"].notna().any():
             sqs_by_club = (
                 chart_shots.dropna(subset=["_sqs"])
@@ -1027,7 +1059,7 @@ with tab_dispersion:
     if chart_shots.empty:
         st.info("No shot data available for the selected filters.")
     else:
-        disp_clubs_avail = sorted(chart_shots["club"].dropna().unique().tolist())
+        disp_clubs_avail = sort_clubs(chart_shots["club"].dropna().unique().tolist())
         col_l, col_r = st.columns([1, 3])
 
         with col_l:
@@ -1056,7 +1088,7 @@ with tab_dispersion:
                 traj_data = [t for t in all_traj if t["id"] in valid_ids]
 
                 palette = px.colors.qualitative.Plotly
-                club_color = {c: palette[i % len(palette)] for i, c in enumerate(sorted(sel_clubs))}
+                club_color = {c: palette[i % len(palette)] for i, c in enumerate(sort_clubs(sel_clubs))}
 
                 fig_disp = go.Figure()
                 has_any_traj = False
@@ -1167,7 +1199,7 @@ with tab_dispersion:
                         max_off = _disp_off.max() if not _disp_off.empty else 30
                         if pd.isna(max_off) or max_off == 0:
                             max_off = 30
-                        x_pad = max(max_off * 1.15, 10)  # 15% breathing room, minimum ±10 yds
+                        x_pad = max(max_off + 3, 25)  # fixed 3 yd margin, minimum ±25 yds for visual context
 
                         max_carry = all_shots["carry"].max() if not all_shots.empty else 300
                         if pd.isna(max_carry) or max_carry == 0:
@@ -1260,7 +1292,7 @@ with tab_dispersion:
                         fig_imp.update_layout(title="Impact Location — Club Averages")
 
                     else:  # Scatter
-                        for i, club in enumerate(sorted(sel_clubs)):
+                        for i, club in enumerate(sort_clubs(sel_clubs)):
                             cd = impact_df[impact_df["club"] == club]
                             if cd.empty:
                                 continue
@@ -1270,7 +1302,7 @@ with tab_dispersion:
                                 y=cd["impact_height"],
                                 mode="markers",
                                 name=club,
-                                customdata=cd[["shot_number", "carry", "smash_factor"]].values,
+                                customdata=cd[["shot_number", "carry", "smash_factor"]].fillna(-1).values,
                                 hovertemplate=(
                                     "<b>Shot %{customdata[0]}</b><br>"
                                     "Carry: %{customdata[1]:.0f} yds<br>"
@@ -1296,18 +1328,15 @@ with tab_dispersion:
                     fig_imp.add_vline(x=0, line_dash="dot", line_color="lightgray", line_width=0.8)
 
                     fig_imp.update_layout(
-                        height=810, plot_bgcolor="white",
+                        height=480, plot_bgcolor="white",
                         xaxis=dict(
                             title="← Heel  ·  Horizontal (cm)  ·  Toe →",
                             range=[-3.5, 3.5],
-                            constrain="domain",
                             fixedrange=True,
                         ),
                         yaxis=dict(
                             title="Vertical (cm)",
                             range=[-3.0, 3.0],
-                            scaleanchor="x",
-                            scaleratio=1,
                             fixedrange=True,
                         ),
                     )
@@ -1383,7 +1412,7 @@ with tab_quality:
         qa_ctrl_l, qa_ctrl_r = st.columns([1, 2])
 
         with qa_ctrl_l:
-            qa_clubs_avail = sorted(qa_base["club"].dropna().unique().tolist())
+            qa_clubs_avail = sort_clubs(qa_base["club"].dropna().unique().tolist())
             qa_clubs = st.multiselect(
                 "Filter by club",
                 qa_clubs_avail,
@@ -1665,7 +1694,7 @@ with tab_quality:
             if qa_clubs:
                 _corr_source = _corr_source[_corr_source["club"].isin(qa_clubs)]
 
-            _corr_clubs = sorted(_corr_source["club"].dropna().unique().tolist())
+            _corr_clubs = sort_clubs(_corr_source["club"].dropna().unique().tolist())
             _corr_cols  = ["Overall"] + _corr_clubs
 
             _corr_matrix: dict = {}

@@ -22,3 +22,4 @@ build/
 
 # Streamlit
 .streamlit/secrets.toml
+.superpowers/

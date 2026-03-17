@@ -27,6 +27,8 @@ REPORT_API = "https://golf-player-activities.trackmangolf.com/api/reports/getact
 
 # m/s → mph conversion for speed fields
 MS_TO_MPH = 2.23694
+# meters → yards conversion for distance fields
+M_TO_YD = 1.09361
 
 # Mapping: DB column → (source key in Measurement, unit conversion fn)
 FIELD_MAP = {
@@ -42,10 +44,10 @@ FIELD_MAP = {
     "face_angle":       ("FaceAngle",       lambda v: round(v, 1)),
     "face_to_path":     ("FaceToPath",      lambda v: round(v, 1)),
     "dynamic_loft":     ("DynamicLoft",     lambda v: round(v, 1)),
-    "carry":            ("Carry",           lambda v: round(v, 1)),
-    "total":            ("Total",           lambda v: round(v, 1)),
-    "offline":          ("TotalSide",       lambda v: round(v, 1)),
-    "peak_height":      ("MaxHeight",       lambda v: round(v, 1)),
+    "carry":            ("Carry",           lambda v: round(v * M_TO_YD, 1)),
+    "total":            ("Total",           lambda v: round(v * M_TO_YD, 1)),
+    "offline":          ("TotalSide",       lambda v: round(v * M_TO_YD, 1)),
+    "peak_height":      ("MaxHeight",       lambda v: round(v * M_TO_YD, 1)),
     "descent_angle":    ("LandingAngle",    lambda v: round(v, 1)),
     "impact_offset":    ("ImpactOffset",    lambda v: round(v * 100, 2)),
     "impact_height":    ("ImpactHeight",    lambda v: round(v * 100, 2)),
