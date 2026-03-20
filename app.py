@@ -4,6 +4,7 @@ Trackman Golf Dashboard
 Run with:  streamlit run app.py
 """
 import json
+import re
 
 import numpy as np
 import pandas as pd
@@ -115,6 +116,35 @@ def sort_clubs(clubs) -> list:
     known   = [c for c in clubs if c in _CLUB_RANK]
     unknown = sorted(c for c in clubs if c not in _CLUB_RANK)
     return sorted(known, key=lambda c: _CLUB_RANK[c]) + unknown
+
+
+CLUB_DISPLAY: dict[str, str] = {
+    "Driver": "Driver",
+    "2Wood": "2 Wood", "3Wood": "3 Wood", "4Wood": "4 Wood", "5Wood": "5 Wood", "7Wood": "7 Wood",
+    "DrivingIron": "Driving Iron",
+    "1Iron": "1 Iron", "2Iron": "2 Iron", "3Iron": "3 Iron", "4Iron": "4 Iron",
+    "5Iron": "5 Iron", "6Iron": "6 Iron", "7Iron": "7 Iron", "8Iron": "8 Iron", "9Iron": "9 Iron",
+    "1Hybrid": "1 Hybrid", "2Hybrid": "2 Hybrid", "3Hybrid": "3 Hybrid",
+    "4Hybrid": "4 Hybrid", "5Hybrid": "5 Hybrid", "6Hybrid": "6 Hybrid", "7Hybrid": "7 Hybrid",
+    "PitchingWedge": "Pitching Wedge",
+    "GapWedge": "Gap Wedge",
+    "SandWedge": "Sand Wedge",
+    "LobWedge": "Lob Wedge",
+    "46Wedge": "46° Wedge", "48Wedge": "48° Wedge", "50Wedge": "50° Wedge",
+    "52Wedge": "52° Wedge", "54Wedge": "54° Wedge", "56Wedge": "56° Wedge",
+    "58Wedge": "58° Wedge", "60Wedge": "60° Wedge", "62Wedge": "62° Wedge", "64Wedge": "64° Wedge",
+    "Putter": "Putter",
+}
+
+
+def display_club(name: str) -> str:
+    """Return a human-readable club name for UI display."""
+    if name in CLUB_DISPLAY:
+        return CLUB_DISPLAY[name]
+    # Fallback: insert spaces before capitals, handle numeric wedge prefixes
+    s = re.sub(r'(\d+)([A-Z])', r'\1 \2', re.sub(r'([a-z])([A-Z])', r'\1 \2', name))
+    s = re.sub(r'^(\d+) Wedge$', r'\1° Wedge', s)
+    return s
 
 
 # PGA Tour carry benchmarks (yards) — fixed reference, not golfer-specific
@@ -295,7 +325,7 @@ if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
     sessions_df = sessions_df[(sessions_df["date"] >= d0) & (sessions_df["date"] <= d1)]
 
 # Club filter
-club_filter = st.sidebar.multiselect("Filter by club", clubs, default=[])
+club_filter = st.sidebar.multiselect("Filter by club", clubs, default=[], format_func=display_club)
 
 # Quality filter
 st.sidebar.markdown("---")
@@ -480,6 +510,7 @@ with tab_overview:
                     .sort_values("Best Carry (yds)", ascending=False)
                     .reset_index(drop=True)
                 )
+                _best_carry["club"] = _best_carry["club"].map(display_club)
                 st.dataframe(_best_carry, hide_index=True, use_container_width=True)
 
 
@@ -517,6 +548,7 @@ with tab_trends:
                     .groupby(["date", "club"])[metric].mean()
                     .reset_index().sort_values("date")
                 )
+                trend_df["club"] = trend_df["club"].map(display_club)
                 fig = px.line(trend_df, x="date", y=metric, color="club", markers=True,
                               labels={"date": "Date", metric: metric_col(metric), "club": "Club"},
                               title=f"{metric_col(metric)} Over Time by Club")
@@ -547,6 +579,9 @@ with tab_trends:
         st.subheader(f"Distribution — {metric_col(metric)}")
         hist_df = ts.dropna(subset=[metric])
         if not hist_df.empty:
+            if group_by_club:
+                hist_df = hist_df.copy()
+                hist_df["club"] = hist_df["club"].map(display_club)
             fig2 = px.histogram(hist_df, x=metric,
                                 color="club" if group_by_club else None,
                                 nbins=30, marginal="box",
@@ -676,6 +711,7 @@ with tab_trends:
                         .groupby(["date", "club"])["_sqs"].mean().reset_index()
                         .sort_values("date")
                     )
+                    sqs_trend["club"] = sqs_trend["club"].map(display_club)
                     sqs_trend["session"] = sqs_trend["date"].dt.strftime("%m/%d/%y")
                     _sqs_club_order = sqs_trend["session"].unique().tolist()
                     fig_sqs = px.line(
@@ -744,6 +780,21 @@ with tab_session:
         selected_ids = [session_options[l] for l in selected_labels]
         multi_session = len(selected_ids) > 1
 
+        compare_ids: list = []
+        compare_mode = False
+        if not select_all and not multi_session:
+            _other_labels = [l for l in session_labels if l not in selected_labels]
+            if _other_labels:
+                compare_labels = st.multiselect(
+                    "Compare to…",
+                    _other_labels,
+                    default=[],
+                    key="compare_sessions",
+                    help="Select one or more sessions to compare against.",
+                )
+                compare_ids = [session_options[l] for l in compare_labels]
+                compare_mode = len(compare_ids) > 0
+
         frames = [load_shots(session_id=sid) for sid in selected_ids]
         session_shots_raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if not session_shots_raw.empty:
@@ -756,6 +807,21 @@ with tab_session:
         if not all_shots.empty and "_sqs" in all_shots.columns:
             sqs_lookup = all_shots.set_index("id")[["_sqs", "_quality"]]
             session_shots = session_shots.join(sqs_lookup, on="id")
+
+        # ── Comparison session data ──────────────────────────────────────
+        comp_shots = pd.DataFrame()
+        if compare_mode:
+            _comp_frames = [load_shots(session_id=sid) for sid in compare_ids]
+            comp_shots = pd.concat(_comp_frames, ignore_index=True) if _comp_frames else pd.DataFrame()
+            if not comp_shots.empty:
+                comp_shots["date"] = pd.to_datetime(comp_shots["date"], errors="coerce")
+                if club_filter:
+                    comp_shots = comp_shots[comp_shots["club"].isin(club_filter)]
+                comp_shots = apply_exclusions(comp_shots)
+                comp_shots = score_shot_quality(comp_shots)
+                comp_shots = comp_shots[~comp_shots["_excluded"]]
+                if quality_filter and len(quality_filter) < len(QUALITY_TIERS):
+                    comp_shots = comp_shots[comp_shots["_quality"].isin(quality_filter)]
 
         if session_shots.empty:
             st.info("No shot data for this session (may need to re-sync).")
@@ -787,32 +853,171 @@ with tab_session:
                 return f"{diff:+.1f} vs prev"
 
             # ── Averages ────────────────────────────────────────────────────
-            st.markdown("#### Averages")
-            if _prev_means:
-                st.caption("Δ vs previous session shown below each metric.")
-            avail = [m for m in KEY_METRICS
-                     if m in sess_clean.columns and sess_clean[m].notna().any()]
+            if compare_mode and not comp_shots.empty:
+                st.markdown("#### Session Comparison")
+                _primary_label = selected_labels[0].split(" – ")[0]  # date portion
+                st.caption(f"Primary session vs average of {len(compare_ids)} comparison session(s).")
 
-            # Show avg SQS first if available
-            avg_sqs = sess_clean["_sqs"].mean() if "_sqs" in sess_clean.columns else None
-            n_avail = len(avail[:10])
-            n_cols  = min(5, n_avail + (1 if avg_sqs is not None and not pd.isna(avg_sqs) else 0))
-            metric_cols = st.columns(n_cols)
+                # Apply quality filter to primary session data for comparison
+                _primary = sess_clean.copy()
+                if quality_filter and len(quality_filter) < len(QUALITY_TIERS) and "_quality" in _primary.columns:
+                    _primary = _primary[_primary["_quality"].isin(quality_filter)]
 
-            col_idx = 0
-            if avg_sqs is not None and not pd.isna(avg_sqs):
-                metric_cols[col_idx % 5].metric(
-                    "Avg SQS", f"{avg_sqs:.1f}",
-                    delta=_delta("_sqs", avg_sqs),
+                _HIGHER_BETTER = {"carry", "total", "ball_speed", "club_speed", "smash_factor", "_sqs"}
+                _ABS_LOWER_BETTER = {"face_to_path", "club_path", "face_angle", "offline",
+                                     "impact_offset", "impact_height", "spin_axis"}
+
+                _comp_metrics = ["_sqs"] + [m for m in KEY_METRICS
+                                            if m in _primary.columns and _primary[m].notna().any()]
+
+                _rows = []
+                for _cm in _comp_metrics:
+                    _p_val = _primary[_cm].mean() if _cm in _primary.columns and _primary[_cm].notna().any() else None
+                    _c_val = comp_shots[_cm].mean() if _cm in comp_shots.columns and comp_shots[_cm].notna().any() else None
+
+                    if _p_val is None and _c_val is None:
+                        continue
+
+                    _p_str = fmt_metric(_p_val, _cm) if _cm != "_sqs" else (f"{_p_val:.1f}" if _p_val is not None and not pd.isna(_p_val) else "–")
+                    _c_str = fmt_metric(_c_val, _cm) if _cm != "_sqs" else (f"{_c_val:.1f}" if _c_val is not None and not pd.isna(_c_val) else "–")
+
+                    _delta_val = None
+                    _delta_str = "–"
+                    if _p_val is not None and _c_val is not None and not pd.isna(_p_val) and not pd.isna(_c_val):
+                        _delta_val = _p_val - _c_val
+                        _delta_str = f"{_delta_val:+.1f}"
+
+                    _label = "SQS" if _cm == "_sqs" else metric_col(_cm)
+                    _rows.append({
+                        "Metric": _label,
+                        "Primary": _p_str,
+                        "Comp Avg": _c_str,
+                        "Δ": _delta_str,
+                        "_delta_val": _delta_val,
+                        "_metric_key": _cm,
+                    })
+
+                if _rows:
+                    _comp_df = pd.DataFrame(_rows)
+
+                    def _delta_color(dv, mk):
+                        """Return CSS background for a delta value given its metric key."""
+                        if dv is None or pd.isna(dv) or dv == 0:
+                            return ""
+                        if mk in _HIGHER_BETTER:
+                            return "background-color: rgba(45,106,79,0.15)" if dv > 0 else "background-color: rgba(230,57,70,0.15)"
+                        if mk in _ABS_LOWER_BETTER:
+                            return "background-color: rgba(230,57,70,0.15)" if dv > 0 else "background-color: rgba(45,106,79,0.15)"
+                        return ""
+
+                    _display_comp = _comp_df[["Metric", "Primary", "Comp Avg", "Δ"]].copy()
+                    _delta_vals = _comp_df["_delta_val"].tolist()
+                    _metric_keys = _comp_df["_metric_key"].tolist()
+
+                    def _style_comp_row(row):
+                        i = row.name
+                        styles = [""] * len(row)
+                        styles[list(row.index).index("Δ")] = _delta_color(_delta_vals[i], _metric_keys[i])
+                        return styles
+
+                    _styled = _display_comp.style.apply(_style_comp_row, axis=1)
+                    st.dataframe(_styled, use_container_width=True, hide_index=True)
+
+                # ── Per-club comparison ─────────────────────────────────────
+                st.markdown("#### Per-Club Comparison")
+                _club_metric_options = ["_sqs"] + [m for m in KEY_METRICS
+                                                    if m in sess_clean.columns]
+                _club_metric = st.selectbox(
+                    "Metric",
+                    _club_metric_options,
+                    index=_club_metric_options.index("carry") if "carry" in _club_metric_options else 0,
+                    format_func=lambda c: "SQS" if c == "_sqs" else metric_col(c),
+                    key="compare_club_metric",
                 )
-                col_idx += 1
-            for m in avail[:10]:
-                cur = sess_clean[m].mean()
-                metric_cols[col_idx % 5].metric(
-                    metric_col(m), fmt_metric(cur, m),
-                    delta=_delta(m, cur), delta_color="off",
-                )
-                col_idx += 1
+
+                _all_clubs_in_comp = set()
+                if not _primary.empty:
+                    _all_clubs_in_comp.update(_primary["club"].dropna().unique())
+                if not comp_shots.empty:
+                    _all_clubs_in_comp.update(comp_shots["club"].dropna().unique())
+
+                _club_rows = []
+                for _club in sort_clubs(list(_all_clubs_in_comp)):
+                    _p_club = _primary[_primary["club"] == _club] if not _primary.empty else pd.DataFrame()
+                    _c_club = comp_shots[comp_shots["club"] == _club] if not comp_shots.empty else pd.DataFrame()
+
+                    _p_avg = _p_club[_club_metric].mean() if not _p_club.empty and _club_metric in _p_club.columns and _p_club[_club_metric].notna().any() else None
+                    _c_avg = _c_club[_club_metric].mean() if not _c_club.empty and _club_metric in _c_club.columns and _c_club[_club_metric].notna().any() else None
+
+                    if _p_avg is None and _c_avg is None:
+                        continue
+
+                    _p_n = int(_p_club[_club_metric].notna().sum()) if not _p_club.empty and _club_metric in _p_club.columns else 0
+                    _c_n = int(_c_club[_club_metric].notna().sum()) if not _c_club.empty and _club_metric in _c_club.columns else 0
+
+                    _fmt = lambda v, m=_club_metric: fmt_metric(v, m) if m != "_sqs" else (f"{v:.1f}" if v is not None and not pd.isna(v) else "–")
+
+                    _d = None
+                    _d_str = "–"
+                    if _p_avg is not None and _c_avg is not None and not pd.isna(_p_avg) and not pd.isna(_c_avg):
+                        _d = _p_avg - _c_avg
+                        _d_str = f"{_d:+.1f}"
+
+                    _club_rows.append({
+                        "Club": display_club(_club),
+                        "Primary": _fmt(_p_avg),
+                        "Comp Avg": _fmt(_c_avg),
+                        "Δ": _d_str,
+                        "Primary n": _p_n,
+                        "Comp n": _c_n,
+                        "_delta_val": _d,
+                        "_metric_key": _club_metric,
+                    })
+
+                if _club_rows:
+                    _club_comp_df = pd.DataFrame(_club_rows)
+                    _club_display = _club_comp_df[["Club", "Primary", "Comp Avg", "Δ", "Primary n", "Comp n"]].copy()
+                    _club_dv = _club_comp_df["_delta_val"].tolist()
+                    _club_mk = _club_comp_df["_metric_key"].tolist()
+
+                    def _style_club_row(row):
+                        i = row.name
+                        styles = [""] * len(row)
+                        styles[list(row.index).index("Δ")] = _delta_color(_club_dv[i], _club_mk[i])
+                        return styles
+
+                    _club_styled = _club_display.style.apply(_style_club_row, axis=1)
+                    st.dataframe(_club_styled, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No club data to compare.")
+
+            else:
+                # ── Original metric tiles (non-compare mode) ─────────────────
+                st.markdown("#### Averages")
+                if _prev_means:
+                    st.caption("Δ vs previous session shown below each metric.")
+                avail = [m for m in KEY_METRICS
+                         if m in sess_clean.columns and sess_clean[m].notna().any()]
+
+                avg_sqs = sess_clean["_sqs"].mean() if "_sqs" in sess_clean.columns else None
+                n_avail = len(avail[:10])
+                n_cols  = min(5, n_avail + (1 if avg_sqs is not None and not pd.isna(avg_sqs) else 0))
+                metric_cols = st.columns(n_cols)
+
+                col_idx = 0
+                if avg_sqs is not None and not pd.isna(avg_sqs):
+                    metric_cols[col_idx % 5].metric(
+                        "Avg SQS", f"{avg_sqs:.1f}",
+                        delta=_delta("_sqs", avg_sqs),
+                    )
+                    col_idx += 1
+                for m in avail[:10]:
+                    cur = sess_clean[m].mean()
+                    metric_cols[col_idx % 5].metric(
+                        metric_col(m), fmt_metric(cur, m),
+                        delta=_delta(m, cur), delta_color="off",
+                    )
+                    col_idx += 1
 
             n_sess_excl = int(session_shots["_excluded"].sum())
             if n_sess_excl:
@@ -844,6 +1049,8 @@ with tab_session:
 
             scatter_df = sess_clean.dropna(subset=[x_metric, y_metric])
             if not scatter_df.empty:
+                scatter_df = scatter_df.copy()
+                scatter_df["club"] = scatter_df["club"].map(display_club)
                 if multi_session:
                     scatter_df = scatter_df.copy()
                     scatter_df["_session"] = scatter_df["date"].dt.strftime("%m/%d/%y")
@@ -886,6 +1093,7 @@ with tab_session:
                 # by club in StrokeGroups, not chronologically, so shot_number alone is
                 # unreliable for existing data — run sync.py --all to fix permanently).
                 _seq_df = sess_clean.copy()
+                _seq_df["club"] = _seq_df["club"].map(display_club)
                 if "shot_time" in _seq_df.columns and _seq_df["shot_time"].notna().any():
                     _seq_df["_sort_key"] = pd.to_datetime(_seq_df["shot_time"], errors="coerce")
                     _seq_df = _seq_df.sort_values("_sort_key").reset_index(drop=True)
@@ -939,6 +1147,7 @@ with tab_session:
                 edit_df["_sess_label"] = edit_df["date"].dt.strftime("%m/%d/%y")
                 base_cols = ["_sess_label"] + base_cols
             editor_input = edit_df[base_cols + display_metrics].copy()
+            editor_input["club"] = editor_input["club"].map(display_club)
             editor_input.insert(len(base_cols), "Exclude", edit_df["_excluded"].astype(bool))
 
             # Add SQS and Tier columns if available
@@ -1018,6 +1227,7 @@ with tab_clubs:
             # Order bars by canonical club order (longest → shortest)
             club_agg["_order"] = club_agg["club"].map(lambda c: _CLUB_RANK.get(c, 999))
             club_agg = club_agg.sort_values("_order").drop(columns="_order")
+            club_agg["club"] = club_agg["club"].map(display_club)
 
             fig = px.bar(club_agg, x="club", y="Average", error_y="Std Dev",
                          text="Average",
@@ -1036,6 +1246,7 @@ with tab_clubs:
         # Order rows by canonical club order
         full_agg["_order"] = full_agg["club"].map(lambda c: _CLUB_RANK.get(c, 999))
         full_agg = full_agg.sort_values("_order").drop(columns="_order")
+        full_agg["club"] = full_agg["club"].map(display_club)
         if "_sqs" in chart_shots.columns and chart_shots["_sqs"].notna().any():
             sqs_by_club = (
                 chart_shots.dropna(subset=["_sqs"])
@@ -1063,11 +1274,14 @@ with tab_dispersion:
         col_l, col_r = st.columns([1, 3])
 
         with col_l:
+            _disp_preferred = ["7Iron", "8Iron", "9Iron", "PitchingWedge"]
+            _disp_default = [c for c in _disp_preferred if c in disp_clubs_avail] or disp_clubs_avail[:min(4, len(disp_clubs_avail))]
             sel_clubs = st.multiselect(
                 "Clubs to display",
                 disp_clubs_avail,
-                default=disp_clubs_avail[:min(4, len(disp_clubs_avail))],
+                default=_disp_default,
                 key="disp_clubs",
+                format_func=display_club,
             )
             view_mode = st.radio("View", ["Top-down", "Side view"], key="disp_view")
             max_shots = st.slider("Max shots per club", 10, 200, 50, 10, key="disp_max",
@@ -1148,7 +1362,7 @@ with tab_dispersion:
                             x=c_lat   + r_lat   * np.cos(theta),
                             y=c_carry + r_carry * np.sin(theta),
                             mode="lines",
-                            name=f"{club} ±1σ",
+                            name=f"{display_club(club)} ±1σ",
                             fill="toself",
                             fillcolor=_hex_to_rgba(club_color[club], 0.12),
                             line=dict(color=club_color[club], width=2.5),
@@ -1158,7 +1372,7 @@ with tab_dispersion:
                         fig_disp.add_trace(go.Scatter(
                             x=[c_lat], y=[c_carry],
                             mode="markers",
-                            name=f"{club} center",
+                            name=f"{display_club(club)} center",
                             marker=dict(color=club_color[club], size=9, symbol="cross-thin",
                                         line=dict(width=2, color=club_color[club])),
                             showlegend=False,
@@ -1176,7 +1390,7 @@ with tab_dispersion:
                             x=[p[0] for p in pts],
                             y=[p[1] for p in pts],
                             mode="markers",
-                            name=club,
+                            name=display_club(club),
                             showlegend=True,
                             marker=dict(
                                 color=club_color[club],
@@ -1199,7 +1413,7 @@ with tab_dispersion:
                         max_off = _disp_off.max() if not _disp_off.empty else 30
                         if pd.isna(max_off) or max_off == 0:
                             max_off = 30
-                        x_pad = max(max_off + 3, 25)  # fixed 3 yd margin, minimum ±25 yds for visual context
+                        x_pad = max(max_off + 5, 100) if max_off > 100 else 100
 
                         max_carry = all_shots["carry"].max() if not all_shots.empty else 300
                         if pd.isna(max_carry) or max_carry == 0:
@@ -1271,8 +1485,8 @@ with tab_dispersion:
                                 x=[row["impact_offset"]],
                                 y=[row["impact_height"]],
                                 mode="markers+text",
-                                name=row["club"],
-                                text=[row["club"]],
+                                name=display_club(row["club"]),
+                                text=[display_club(row["club"])],
                                 textposition="top center",
                                 textfont=dict(size=10, color=c),
                                 customdata=[[int(row["n"])]],
@@ -1301,7 +1515,7 @@ with tab_dispersion:
                                 x=cd["impact_offset"],
                                 y=cd["impact_height"],
                                 mode="markers",
-                                name=club,
+                                name=display_club(club),
                                 customdata=cd[["shot_number", "carry", "smash_factor"]].fillna(-1).values,
                                 hovertemplate=(
                                     "<b>Shot %{customdata[0]}</b><br>"
@@ -1418,6 +1632,7 @@ with tab_quality:
                 qa_clubs_avail,
                 default=qa_clubs_avail,
                 key="qa_clubs",
+                format_func=display_club,
                 help="Restrict the analysis to specific clubs, or leave all selected for a full-bag view.",
             )
 
@@ -1685,11 +1900,13 @@ with tab_quality:
             st.subheader("Metric Correlations with SQS")
             st.caption(
                 "Pearson r of each swing metric against Shot Quality Score, computed per club. "
+                "Overall = average of per-club correlations (avoids cross-club confounding). "
                 "Strong positive r → metric rises with shot quality. "
                 "Strong negative r → lower (or closer-to-zero) values tend to accompany better shots. "
                 "Grey cells have too few shots to compute reliably (< 10)."
             )
-            _corr_pool = [m for m in qa_metric_pool if m in qa_base.columns]
+            _CORR_EXCLUDE = {"carry", "ball_speed", "smash_factor", "total_spin"}
+            _corr_pool = [m for m in qa_metric_pool if m in qa_base.columns and m not in _CORR_EXCLUDE]
             _corr_source = qa_base.dropna(subset=["_sqs"])
             if qa_clubs:
                 _corr_source = _corr_source[_corr_source["club"].isin(qa_clubs)]
@@ -1698,8 +1915,9 @@ with tab_quality:
             _corr_cols  = ["Overall"] + _corr_clubs
 
             _corr_matrix: dict = {}
-            for _cc in _corr_cols:
-                _cd = _corr_source if _cc == "Overall" else _corr_source[_corr_source["club"] == _cc]
+            # Compute per-club correlations first
+            for _cc in _corr_clubs:
+                _cd = _corr_source[_corr_source["club"] == _cc]
                 _row: dict = {}
                 for _cm in _corr_pool:
                     _pair = _cd[["_sqs", _cm]].dropna()
@@ -1708,9 +1926,19 @@ with tab_quality:
                     else:
                         _row[_cm] = np.nan
                 _corr_matrix[_cc] = _row
+            # Overall = average of per-club correlations (avoids Simpson's paradox)
+            _overall_row: dict = {}
+            for _cm in _corr_pool:
+                _vals = [_corr_matrix[c][_cm] for c in _corr_clubs if not pd.isna(_corr_matrix[c].get(_cm, np.nan))]
+                _overall_row[_cm] = round(float(np.mean(_vals)), 2) if _vals else np.nan
+            _corr_matrix["Overall"] = _overall_row
 
             _corr_df = pd.DataFrame(_corr_matrix, index=_corr_pool)   # metrics × clubs
-            _corr_display = _corr_df.rename(index={m: metric_col(m) for m in _corr_pool})
+            # Sort metrics by Overall correlation (descending, NaN last)
+            if "Overall" in _corr_df.columns:
+                _corr_df = _corr_df.sort_values("Overall", ascending=False, na_position="last")
+            _col_rename = {c: display_club(c) for c in _corr_clubs}
+            _corr_display = _corr_df.rename(index={m: metric_col(m) for m in _corr_df.index}, columns=_col_rename)
 
             fig_corr = px.imshow(
                 _corr_display,
@@ -1723,11 +1951,12 @@ with tab_quality:
             # Annotate cells with r value
             _corr_annots = []
             for _ci, _cc in enumerate(_corr_cols):
-                for _ri, _cm in enumerate(_corr_pool):
+                _cc_display = _col_rename.get(_cc, _cc)  # "Overall" stays; clubs get display name
+                for _ri, _cm in enumerate(_corr_df.index):
                     _rv = _corr_matrix[_cc].get(_cm, np.nan)
                     if not pd.isna(_rv):
                         _corr_annots.append(dict(
-                            x=_cc, y=metric_col(_cm),
+                            x=_cc_display, y=metric_col(_cm),
                             text=f"{_rv:.2f}",
                             showarrow=False,
                             font=dict(size=10, color="black"),

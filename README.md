@@ -81,8 +81,8 @@ Benchmarks are fixed PGA Tour numbers â€” not derived from your personal data â€
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-cd trackman-analysis
+git clone https://github.com/6bsszkcs97-coder/Trackman-analysis.git
+cd Trackman-analysis
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
