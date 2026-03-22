@@ -160,7 +160,9 @@ TOUR_CARRY = {
     "9Iron":          148, "9-Iron": 148,
     "PitchingWedge":  136, "PW": 136,
     "50Wedge":        120, "50° Wedge": 120,
+    "52Wedge":        112, "52° Wedge": 112,
     "54Wedge":        103, "54° Wedge": 103,
+    "56Wedge":         95, "56° Wedge": 95,
     "58Wedge":         86, "58° Wedge": 86,
     "SandWedge":      115, "Sand Wedge": 115,
 }
@@ -178,7 +180,9 @@ TOUR_DISP = {
     "9Iron":           6, "9-Iron": 6,
     "PitchingWedge":   6, "PW": 6,
     "50Wedge":         5, "50° Wedge": 5,
+    "52Wedge":         5, "52° Wedge": 5,
     "54Wedge":         5, "54° Wedge": 5,
+    "56Wedge":         5, "56° Wedge": 5,
     "58Wedge":         5, "58° Wedge": 5,
     "SandWedge":       5, "Sand Wedge": 5,
 }
@@ -1251,6 +1255,7 @@ with tab_clubs:
             sqs_by_club = (
                 chart_shots.dropna(subset=["_sqs"])
                 .groupby("club")["_sqs"].mean().round(1)
+                .rename(index=display_club)
             )
             full_agg["_sqs"] = full_agg["club"].map(sqs_by_club)
             full_agg = full_agg[["club", "_sqs"] + avail_metrics]
