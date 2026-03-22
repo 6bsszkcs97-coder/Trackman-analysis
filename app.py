@@ -4,6 +4,7 @@ Trackman Golf Dashboard
 Run with:  streamlit run app.py
 """
 import json
+import os
 import re
 
 import numpy as np
@@ -11,10 +12,44 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from cloud_fetch import fetch_sessions_from_urls
 
-import db
+CLOUD_MODE = os.environ.get("CLOUD_MODE") == "1" or not os.path.exists("data/trackman.db")
+
+if not CLOUD_MODE:
+    import db
 
 st.set_page_config(page_title="Trackman Dashboard", page_icon="⛳", layout="wide")
+
+if CLOUD_MODE and "cloud_shots" not in st.session_state:
+    st.title("Trackman Shot Analysis Dashboard")
+    st.markdown(
+        "Paste your Trackman activity URLs below to analyze your sessions. "
+        "Open each session in [portal.trackmangolf.com](https://portal.trackmangolf.com), "
+        "then copy the URL from your browser's address bar."
+    )
+    urls_input = st.text_area(
+        "Trackman activity URLs (one per line)",
+        height=200,
+        placeholder="https://web-dynamic-reports.trackmangolf.com/?a=...\nhttps://web-dynamic-reports.trackmangolf.com/?a=...",
+    )
+    if st.button("Load Sessions", type="primary"):
+        if urls_input.strip():
+            with st.spinner("Fetching shot data from Trackman..."):
+                shots_df, sessions_df, errors = fetch_sessions_from_urls(urls_input)
+            if not shots_df.empty:
+                st.session_state["cloud_shots"] = shots_df
+                st.session_state["cloud_sessions"] = sessions_df
+                if errors:
+                    st.warning(f"Loaded {len(sessions_df)} session(s). Errors: " + "; ".join(errors))
+                st.rerun()
+            else:
+                st.error("No data could be loaded. " + "; ".join(errors))
+        else:
+            st.warning("Please paste at least one URL.")
+    st.markdown("---")
+    st.caption("Not affiliated with or endorsed by Trackman A/S. For personal use only.")
+    st.stop()
 
 METRIC_LABELS = {
     "ball_speed":       "Ball Speed (mph)",
@@ -46,20 +81,59 @@ KEY_METRICS = ["ball_speed", "club_speed", "smash_factor", "carry", "total",
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=30)
 def load_sessions():
+    if CLOUD_MODE:
+        return st.session_state.get("cloud_sessions", pd.DataFrame())
+    return _load_sessions_db()
+
+@st.cache_data(ttl=30)
+def _load_sessions_db():
     return pd.DataFrame(db.get_sessions())
 
+def _load_shots_cloud(session_id=None, club=None):
+    """Load shots from session_state (no caching needed — already in memory)."""
+    df = st.session_state.get("cloud_shots", pd.DataFrame())
+    if session_id is not None and not df.empty:
+        if isinstance(session_id, list):
+            df = df[df["session_id"].isin(session_id)]
+        else:
+            df = df[df["session_id"] == session_id]
+    if club is not None and not df.empty:
+        df = df[df["club"] == club]
+    return df
+
 @st.cache_data(ttl=30)
-def load_shots(session_id=None, club=None):
+def _load_shots_db(session_id=None, club=None):
     return pd.DataFrame(db.get_shots(session_id=session_id, club=club))
 
-@st.cache_data(ttl=30)
+def load_shots(session_id=None, club=None):
+    if CLOUD_MODE:
+        return _load_shots_cloud(session_id, club)
+    return _load_shots_db(session_id, club)
+
 def load_clubs():
-    return sort_clubs(db.get_clubs())
+    if CLOUD_MODE:
+        df = st.session_state.get("cloud_shots", pd.DataFrame())
+        if df.empty:
+            return []
+        return sort_clubs(df["club"].dropna().unique().tolist())
+    return _load_clubs_db()
 
 @st.cache_data(ttl=30)
+def _load_clubs_db():
+    return sort_clubs(db.get_clubs())
+
 def load_trajectories():
+    if CLOUD_MODE:
+        df = st.session_state.get("cloud_shots", pd.DataFrame())
+        if df.empty or "raw_json" not in df.columns:
+            return []
+        cols = ["id", "session_id", "shot_number", "club", "raw_json"]
+        return df[df["raw_json"].notna()][cols].to_dict("records")
+    return _load_trajectories_db()
+
+@st.cache_data(ttl=30)
+def _load_trajectories_db():
     return db.get_trajectories()
 
 def parse_trajectory(raw_json_str):
@@ -412,6 +486,16 @@ st.sidebar.caption(
     f"{session_label} · {len(all_shots):,} shots"
     + (f" · {n_manual} manually excluded" if n_manual else "")
 )
+
+if CLOUD_MODE:
+    st.sidebar.markdown("---")
+    if st.sidebar.button("Load new sessions"):
+        for key in ["cloud_shots", "cloud_sessions"]:
+            st.session_state.pop(key, None)
+        st.cache_data.clear()
+        st.rerun()
+st.sidebar.markdown("---")
+st.sidebar.caption("Not affiliated with or endorsed by Trackman A/S. For personal use only.")
 
 # chart_shots = what every chart/average uses (manual exclusions + quality filter)
 chart_shots = all_shots[~all_shots["_excluded"]]
@@ -1189,7 +1273,13 @@ with tab_session:
 
                 if changed:
                     for i, new_val in changed:
-                        db.update_shot_excluded(shot_ids[i], 1 if new_val else None)
+                        if CLOUD_MODE:
+                            cloud_df = st.session_state.get("cloud_shots", pd.DataFrame())
+                            if not cloud_df.empty:
+                                cloud_df.loc[cloud_df["id"] == shot_ids[i], "excluded"] = 1 if new_val else None
+                                st.session_state["cloud_shots"] = cloud_df
+                        else:
+                            db.update_shot_excluded(shot_ids[i], 1 if new_val else None)
                     editor_key = f"shot_editor_{'_'.join(sorted(selected_ids))}"
                     if editor_key in st.session_state:
                         del st.session_state[editor_key]
@@ -1321,19 +1411,30 @@ with tab_dispersion:
                         if not traj:
                             continue
                         has_any_traj = True
+                        _M2Y = 1.09361  # trajectory coords are in meters
+                        # Truncate trajectory at first ground contact (carry only)
+                        carry_traj = traj
+                        for _ti in range(1, len(traj)):
+                            if traj[_ti].get("Y", 1) <= 0 and traj[_ti - 1].get("Y", 1) > 0:
+                                carry_traj = traj[:_ti + 1]
+                                break
+                        # Extract Measurement carry/offline for accurate landing dots
+                        _stroke_data = json.loads(shot["raw_json"])
+                        _meas = _stroke_data.get("Measurement", {})
+                        _carry_yd = (_meas.get("Carry") or 0) * _M2Y
+                        _offline_yd = (_meas.get("TotalSide") or 0) * _M2Y
                         if view_mode == "Top-down":
                             # NOTE: has_any_traj is set above, before the show_tracers guard —
                             # keep it there so the "No trajectory data" warning is suppressed
                             # even when tracers are toggled off.
                             if show_tracers:
-                                xs.extend([pt.get("Z", 0) for pt in traj] + [None])
-                                ys.extend([pt.get("X", 0) for pt in traj] + [None])
-                            landing_pts[club].append(
-                                (traj[-1].get("Z", 0), traj[-1].get("X", 0))
-                            )
+                                xs.extend([pt.get("Z", 0) * _M2Y for pt in carry_traj] + [None])
+                                ys.extend([pt.get("X", 0) * _M2Y for pt in carry_traj] + [None])
+                            # Use Measurement carry/offline for precise landing dot
+                            landing_pts[club].append((_offline_yd, _carry_yd))
                         else:
-                            xs.extend([pt.get("X", 0) for pt in traj] + [None])
-                            ys.extend([pt.get("Y", 0) for pt in traj] + [None])
+                            xs.extend([pt.get("X", 0) * _M2Y for pt in carry_traj] + [None])
+                            ys.extend([pt.get("Y", 0) * _M2Y for pt in carry_traj] + [None])
 
                     if show_tracers:
                         if xs:
@@ -1427,7 +1528,7 @@ with tab_dispersion:
 
                         fig_disp.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.4)
                         fig_disp.update_layout(
-                            title="Shot Dispersion — Top-down View",
+                            title="Shot Dispersion — Top-down View (carry only)",
                             xaxis_title="← Left  ·  Offline (yds)  ·  Right →",
                             yaxis_title="Carry Distance (yds)",
                             xaxis=dict(range=[-x_pad, x_pad]),
@@ -1437,7 +1538,7 @@ with tab_dispersion:
                         )
                     else:
                         fig_disp.update_layout(
-                            title="Ball Flight Profile — Side View",
+                            title="Ball Flight Profile — Side View (carry only)",
                             xaxis_title="Carry Distance (yds)",
                             yaxis_title="Height (yds)",
                             height=400,
