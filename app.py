@@ -19,7 +19,7 @@ CLOUD_MODE = os.environ.get("CLOUD_MODE") == "1" or not os.path.exists("data/tra
 if not CLOUD_MODE:
     import db
 
-st.set_page_config(page_title="Trackman Dashboard", page_icon="⛳", layout="wide")
+st.set_page_config(page_title="Trackman Shot Analysis", page_icon="⛳", layout="wide")
 
 if CLOUD_MODE and "cloud_shots" not in st.session_state:
     st.title("Trackman Shot Analysis Dashboard")
@@ -388,7 +388,7 @@ sessions_df = load_sessions()
 clubs = load_clubs()
 
 if sessions_df.empty:
-    st.title("⛳ Trackman Dashboard")
+    st.title("⛳ Trackman Shot Analysis")
     st.warning("No data yet. Run `python sync.py` to pull your sessions.", icon="⚠️")
     st.code("python sync.py", language="bash")
     st.stop()

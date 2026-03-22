@@ -1,18 +1,21 @@
-# Trackman Golf Dashboard
+# Trackman Shot Analysis
 
-A personal analytics dashboard for [Trackman](https://www.trackman.com/) golf data. Scrapes your shot history from the Trackman portal, stores it locally in SQLite, and visualizes it in an interactive Streamlit app — entirely on your own machine, no cloud required.
+An analytics dashboard for [Trackman](https://www.trackman.com/) golf data. Syncs your shot history from the Trackman portal, scores every shot against PGA Tour benchmarks, and visualizes everything in an interactive Streamlit app.
+
+**Try it now:** [trackman-shot-analysis.streamlit.app](https://trackman-shot-analysis.streamlit.app/) — paste your Trackman activity URLs, no install required.
 
 ---
 
 ## Features
 
-- **Sync your data** — logs into `portal.trackmangolf.com` with your own credentials and pulls your shot history into a local database
-- **Shot Quality Score (SQS)** — proprietary 0–100 scoring system benchmarked against PGA Tour averages for carry distance and accuracy, not your personal averages
-- **Trends page** — metrics over time, shot quality distribution per session, avg SQS trend by club
-- **Session detail** — per-session shot log with manual exclusion, scatter plot explorer, session averages
-- **Club comparison** — side-by-side averages and radar chart across clubs
-- **Shot Dispersion** — top-down trajectory view with dots-only mode, ±1σ dispersion ellipses per club, and fixed axis scaling
-- **CSV export** — one-click download of every shot with all metrics and SQS scores
+- **Shot Quality Score (SQS)** — 0–100 scoring system benchmarked against PGA Tour averages for carry distance and accuracy
+- **Sessions overview** — session history with avg SQS, personal records panel, and one-click CSV export
+- **Trends** — metrics over time, shot quality distribution per session, avg SQS trend by club with configurable rolling average
+- **Session detail** — per-session shot log with manual exclusion, scatter plot explorer, shot sequence chart, and session comparison
+- **Club stats** — side-by-side club averages table, clubface impact location chart (aggregate and scatter modes)
+- **Shot dispersion** — carry-only top-down and side-view trajectory charts with ghost tracers, ±1σ dispersion ellipses, and fixed axis scaling
+- **Quality analysis** — heatmap, distribution charts, and metric correlations with SQS, with optional tier grouping
+- **Cloud mode** — paste Trackman activity URLs directly in the browser for instant analysis, no install or account needed
 
 ---
 
@@ -44,14 +47,14 @@ A personal analytics dashboard for [Trackman](https://www.trackman.com/) golf da
 | Spin | Total Spin (rpm), Spin Axis, Dynamic Loft |
 | Shape | Club Path, Face Angle, Face to Path |
 | Distance | Carry (yds), Total Distance (yds), Offline (yds), Peak Height (yds) |
-| Landing | Descent Angle, Impact Offset (cm), Impact Height (cm) |
+| Impact | Descent Angle, Impact Offset (cm), Impact Height (cm) |
 
 ---
 
 ## Shot Quality Score (SQS)
 
 ```
-SQS = (0.60 × Carry Score) + (0.40 × Accuracy Score)
+SQS = (0.60 x Carry Score) + (0.40 x Accuracy Score)
 ```
 
 **Carry Score** — actual carry vs PGA Tour average for that club, on a power curve (exponent 1.4). 100% of tour carry = 100. 50% or below = 0.
@@ -60,55 +63,56 @@ SQS = (0.60 × Carry Score) + (0.40 × Accuracy Score)
 
 | Tier | SQS |
 |---|---|
-| Tour Quality | 87–100 |
-| Solid | 70–86 |
-| Playable | 50–69 |
-| Scramble | 25–49 |
-| Mishit | 0–24 |
+| Tour Quality | 87-100 |
+| Solid | 70-86 |
+| Playable | 50-69 |
+| Scramble | 25-49 |
+| Mishit | 0-24 |
 
-Benchmarks are fixed PGA Tour numbers — not derived from your personal data — so scores are consistent and comparable across sessions and golfers.
+Benchmarks are fixed PGA Tour numbers, not derived from your personal data, so scores are consistent and comparable across sessions and golfers.
 
 ---
 
-## Requirements
+## Quick start (cloud)
+
+No install required. Visit [trackman-shot-analysis.streamlit.app](https://trackman-shot-analysis.streamlit.app/), paste one or more Trackman activity URLs, and click **Load Sessions**.
+
+To get your activity URLs: open [portal.trackmangolf.com](https://portal.trackmangolf.com), navigate to a session, and copy the URL from your browser's address bar. Data is processed in your browser session only and is not stored anywhere.
+
+---
+
+## Local setup
+
+For persistent data storage and faster loading, run the dashboard locally.
+
+### Requirements
 
 - Python 3.11+
 - A [Trackman portal](https://portal.trackmangolf.com) account
 
----
-
-## Setup
+### Install
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/6bsszkcs97-coder/Trackman-analysis.git
+git clone https://github.com/steve-moretti/Trackman-analysis.git
 cd Trackman-analysis
 
-# 2. Create and activate a virtual environment
 python -m venv .venv
 source .venv/bin/activate       # macOS / Linux
 .venv\Scripts\activate          # Windows
 
-# 3. Install dependencies
 pip install -r requirements.txt
-
-# 4. Install the Playwright browser
 playwright install chromium
 ```
 
----
-
-## Usage
-
 ### Sync your data
 
-Run this after each session (or any time you want fresh data):
+Run after each range session:
 
 ```bash
 python sync.py
 ```
 
-A Chrome window opens — log in with your Trackman account. Your session is saved to `data/browser_session.json` so you only need to log in once. All sessions and shots are stored in `data/trackman.db`.
+A Chrome window opens. Log in with your Trackman account. Your session is saved to `data/browser_session.json` so you only need to log in once. All sessions and shots are stored in `data/trackman.db`.
 
 To force a full re-sync of every session:
 
@@ -129,28 +133,27 @@ Opens at [http://localhost:8501](http://localhost:8501).
 ## Project structure
 
 ```
-├── app.py                  # Streamlit dashboard
-├── sync.py                 # Data sync script (Playwright + REST API)
-├── db.py                   # SQLite layer
-├── requirements.txt
-├── data/
-│   ├── trackman.db         # Your shot database (gitignored)
-│   ├── browser_session.json  # Saved login session (gitignored)
-│   └── raw/                # Raw API responses, useful for debugging
+app.py                  # Streamlit dashboard
+cloud_fetch.py          # Cloud mode — fetch data from Trackman API
+sync.py                 # Local sync script (Playwright + REST API)
+db.py                   # SQLite layer
+requirements.txt
+data/
+  trackman.db           # Your shot database (gitignored)
+  browser_session.json  # Saved login session (gitignored)
+  raw/                  # Raw API responses for debugging
 ```
 
 ---
 
 ## How sync works
 
-1. A browser window opens and you log into your Trackman account normally
-2. The sync script reads your session list from the network responses the portal already loads for you
-3. Each session has a shareable report link — shot data is fetched from that link's public endpoint
-4. Speeds are converted from m/s → mph; all distances are already in yards
+1. A browser window opens and you log into your Trackman account
+2. The sync script reads your session list from the network responses the portal loads
+3. Each session's shot data is fetched from Trackman's public report endpoint
+4. Speeds are converted from m/s to mph; distances from meters to yards
 
-**Supported activity types**
-
-Only **Shot Analysis** sessions are synced. Other activity types (virtual rounds, simulated courses, etc.) are not currently supported and will be silently skipped during sync — they won't appear in the dashboard. You can inspect `data/raw/*.json` to see what `kind` values your account contains if you want to understand what's being filtered out.
+**Supported activity types:** Only **Shot Analysis** sessions are synced. Other activity types (virtual rounds, simulated courses, etc.) are silently skipped during sync.
 
 ---
 
@@ -162,18 +165,18 @@ Only **Shot Analysis** sessions are synced. Other activity types (virtual rounds
 
 **New session not appearing** — Click **Refresh data** in the sidebar or restart the app.
 
-**Missing metrics for some shots** — Some shots (topped balls, chips) may have incomplete TrackMan data. This is expected; those shots will have `null` for the affected fields.
-
-**Parsing issues** — Raw API responses are saved to `data/raw/*.json`. Inspect those files to check field names if you need to modify `FIELD_MAP` in `sync.py`.
+**Missing metrics** — Some shots (topped balls, chips) may have incomplete Trackman data. Those shots will have blank fields for the affected metrics.
 
 ---
 
 ## Privacy
 
-All data is stored locally on your machine. Nothing is sent to any external server beyond the Trackman API calls needed to fetch your own data.
+**Local mode:** All data is stored on your machine. Nothing is sent anywhere beyond the Trackman API calls needed to fetch your own data.
+
+**Cloud mode:** Data flows directly from Trackman's API to your browser session. Nothing is stored on the server. Close the tab and the data is gone.
 
 ---
 
 ## Disclaimer
 
-This is an independent personal project and is not affiliated with, endorsed by, or associated with Trackman A/S in any way. Trackman is a registered trademark of Trackman A/S. This tool accesses only your own data using your own credentials and is intended strictly for personal use.
+This is an independent personal project and is not affiliated with, endorsed by, or associated with Trackman A/S in any way. Trackman is a registered trademark of Trackman A/S. This tool accesses only your own data using your own credentials and is intended for personal use.
